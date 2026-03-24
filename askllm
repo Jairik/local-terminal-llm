@@ -1,0 +1,203 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import shutil
+import subprocess
+import sys
+import threading
+import time
+
+DEFAULT_MODEL = os.environ.get("ASK_MODEL", "phi3:mini")
+DEFAULT_SYSTEM = os.environ.get("ASK_SYSTEM", "")
+
+COMMAND_ONLY_SYSTEM = """You are a Linux shell command generator.
+Return exactly one fenced sh code block containing only the command.
+No prose. No explanation. No bullets. No leading '$'.
+Assume zsh on Linux unless the user says otherwise.
+Prefer one command or one pipeline.
+"""
+
+SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+
+
+def supports_color() -> bool:
+    return sys.stderr.isatty() and os.environ.get("TERM", "") != "dumb"
+
+
+def color(text: str, code: str) -> str:
+    if not supports_color():
+        return text
+    return f"\033[{code}m{text}\033[0m"
+
+
+def spinner(stop_event: threading.Event, message: str) -> None:
+    i = 0
+    while not stop_event.is_set():
+        frame = SPINNER_FRAMES[i % len(SPINNER_FRAMES)]
+        sys.stderr.write(f"\r{color(frame, '36')} {message}")
+        sys.stderr.flush()
+        time.sleep(0.08)
+        i += 1
+
+    sys.stderr.write("\r" + " " * (len(message) + 4) + "\r")
+    sys.stderr.flush()
+
+
+def extract_code_block(text: str) -> str:
+    match = re.search(r"```(?:\w+)?\n(.*?)```", text, re.DOTALL)
+    if match:
+        return match.group(1).strip()
+    return text.strip()
+
+
+def clean_command_output(text: str) -> str:
+    text = extract_code_block(text).strip()
+
+    # Remove a leading shell prompt if the model includes one
+    text = re.sub(r"^\$\s*", "", text)
+
+    # Strip stray backticks if present
+    text = text.strip("`").strip()
+
+    return text
+
+
+def build_prompt(user_prompt: str, stdin_text: str) -> str:
+    user_prompt = user_prompt.strip()
+    stdin_text = stdin_text.strip()
+
+    if stdin_text and user_prompt:
+        return (
+            "Use the following stdin content as context.\n\n"
+            f"{stdin_text}\n\n"
+            "User request:\n"
+            f"{user_prompt}"
+        )
+    if stdin_text and not user_prompt:
+        return stdin_text
+    return user_prompt
+
+
+def run_llm(
+    prompt: str,
+    model: str,
+    command_only: bool,
+    system_prompt: str,
+    show_spinner: bool,
+) -> int:
+    if not shutil.which("llm"):
+        sys.stderr.write("Error: `llm` is not installed or not on PATH.\n")
+        return 127
+
+    cmd = ["llm", "-m", model, "--no-stream"]
+
+    if command_only:
+        cmd.append("-x")
+
+    if system_prompt:
+        cmd.extend(["--system", system_prompt])
+
+    cmd.append(prompt)
+
+    stop_event = threading.Event()
+    spinner_thread = None
+
+    try:
+        if show_spinner and sys.stderr.isatty():
+            label = f"Thinking with {model}"
+            spinner_thread = threading.Thread(
+                target=spinner, args=(stop_event, label), daemon=True
+            )
+            spinner_thread.start()
+
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    finally:
+        stop_event.set()
+        if spinner_thread is not None:
+            spinner_thread.join()
+
+    if proc.returncode != 0:
+        sys.stderr.write(proc.stderr or "Unknown llm error\n")
+        return proc.returncode
+
+    output = proc.stdout.strip()
+
+    if command_only:
+        output = clean_command_output(output)
+
+    sys.stdout.write(output + ("\n" if output and not output.endswith("\n") else ""))
+    return 0
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="askllm",
+        description="CLI wrapper around `llm` with command-only mode and spinner.",
+    )
+    parser.add_argument(
+        "-co",
+        "--command-only",
+        action="store_true",
+        help="Output only the command.",
+    )
+    parser.add_argument(
+        "-m",
+        "--model",
+        default=DEFAULT_MODEL,
+        help=f"Model to use (default: {DEFAULT_MODEL})",
+    )
+    parser.add_argument(
+        "-s",
+        "--system",
+        default=DEFAULT_SYSTEM,
+        help="Optional system prompt for normal mode.",
+    )
+    parser.add_argument(
+        "--no-spinner",
+        action="store_true",
+        help="Disable loading animation.",
+    )
+    parser.add_argument(
+        "prompt",
+        nargs="*",
+        help="Prompt text.",
+    )
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+
+    stdin_text = ""
+    if not sys.stdin.isatty():
+        stdin_text = sys.stdin.read()
+
+    user_prompt = " ".join(args.prompt).strip()
+    prompt = build_prompt(user_prompt, stdin_text)
+
+    if not prompt:
+        sys.stderr.write("Usage: ask [options] \"your prompt here\"\n")
+        return 2
+
+    system_prompt = COMMAND_ONLY_SYSTEM if args.command_only else args.system
+
+    return run_llm(
+        prompt=prompt,
+        model=args.model,
+        command_only=args.command_only,
+        system_prompt=system_prompt,
+        show_spinner=not args.no_spinner,
+    )
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
