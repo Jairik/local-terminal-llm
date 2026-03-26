@@ -12,19 +12,19 @@ dry_run=0
 dep_only=0
 embedding_model="sentence-transformers/all-MiniLM-L6-v2"
 ask_hotkey=""
-ask_hotkey_set=0
+ask_hotkey_set=1
 ask_command=""
 ask_command_set=0
 codex_hotkey=""
-codex_hotkey_set=0
+codex_hotkey_set=1
 codex_command=""
 codex_command_set=0
 claude_hotkey=""
-claude_hotkey_set=0
+claude_hotkey_set=1
 claude_command=""
 claude_command_set=0
 custom_hotkey=""
-custom_hotkey_set=0
+custom_hotkey_set=1
 custom_command=""
 custom_command_set=0
 alias_name=""
@@ -62,6 +62,8 @@ Notes:
   If --alias is not provided and setup is interactive, you will be prompted:
   - Enter/Y -> use default alias `ask`
   - n       -> enter a custom alias name
+  Hotkeys are disabled by default during setup.
+  Pass --ask-hotkey / --codex-hotkey / --claude-hotkey / --custom-hotkey to enable them.
 
 Examples:
   ./scripts/setup.sh

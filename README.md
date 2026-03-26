@@ -28,6 +28,7 @@ A local-first shell copilot wrapper around the `llm` CLI.
 ```
 
 When run interactively, `setup.sh` asks whether to keep the default command alias `ask` or configure a custom alias.
+Hotkeys are disabled by default when using `setup.sh`.
 
 Then reload your shell config (or open a new shell).
 
@@ -53,10 +54,16 @@ You can also configure them during install/setup:
 ./scripts/setup.sh --shell zsh --codex-hotkey '^O' --claude-hotkey '^Y'
 ```
 
-Default:
+Default when using `setup.sh`:
 
-- `ASK_HOTKEY_ASK=^I` inserts `ask `
+- all askllm hotkeys are disabled
 - zsh integration wraps `ask` with `noglob`, so unquoted prompts like `ask --web what day is it?` work.
+
+To remove all existing keybindings from your shell config:
+
+```sh
+./scripts/remove-keybindings.sh
+```
 
 You can also configure shortcuts for other CLI tools like codex or claude:
 
@@ -186,6 +193,7 @@ ask --help
 ./scripts/setup.sh --help
 ./scripts/install-shell-extension.sh --help
 ./scripts/install-askllm.sh --help
+./scripts/remove-keybindings.sh --help
 ./scripts/devdocs_scraper.py --help
 ```
 

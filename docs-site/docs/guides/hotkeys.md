@@ -15,9 +15,17 @@ Default alias is `ask`, configurable during setup or via `--alias`.
 
 ## Hotkey Setup via Script
 
+Hotkeys are disabled by default when using `setup.sh`.
+
 ```sh
 ./scripts/setup.sh --shell zsh --hotkey '^G'
 ./scripts/setup.sh --shell zsh --codex-hotkey '^O' --claude-hotkey '^Y'
+```
+
+Remove all existing askllm keybindings:
+
+```sh
+./scripts/remove-keybindings.sh
 ```
 
 ## Environment Variable Controls
