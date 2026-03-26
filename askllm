@@ -2,25 +2,123 @@
 from __future__ import annotations
 
 import argparse
+import getpass
+import hashlib
+import json
 import os
+import queue
 import re
+import shlex
 import shutil
+import sqlite3
 import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable
 
-DEFAULT_MODEL = os.environ.get("ASK_MODEL", "phi3:mini")
+BUILTIN_DEFAULT_MODEL = "phi3:mini"
 DEFAULT_SYSTEM = os.environ.get("ASK_SYSTEM", "")
+DEFAULT_DOCS_DB = os.environ.get("ASK_DOCS_DB", "~/.local/share/ask/docs")
+DEFAULT_DOCS_COLLECTION = os.environ.get("ASK_DOCS_COLLECTION", "")
+DEFAULT_WEB_PROVIDER = os.environ.get("ASK_WEB_PROVIDER", "auto")
+DEFAULT_CONFIG_FILE = os.environ.get("ASK_CONFIG_FILE", "~/.config/askllm/config.json")
+DEFAULT_POWER_MODEL = os.environ.get("ASK_POWER_MODEL", "gpt-5.4")
+DEFAULT_SPINNER_STYLE = os.environ.get("ASK_SPINNER_STYLE", "line")
+DEFAULT_TTS_MODEL = os.environ.get("ASK_TTS_MODEL", "~/.local/share/piper/en_US-lessac-medium.onnx")
+DEFAULT_TTS_SAMPLE_RATE = os.environ.get("ASK_TTS_SAMPLE_RATE", "22050")
+DEFAULT_TTS_MODE = os.environ.get("ASK_TTS_MODE", "full").strip().lower()
+MODEL_SELECT_INTERACTIVE_SENTINEL = "__interactive_model_select__"
+AUDIO_PLAYBACK_LOCK = threading.Lock()
+
+if DEFAULT_TTS_MODE not in {"full", "stream"}:
+    DEFAULT_TTS_MODE = "full"
+
+try:
+    DEFAULT_TTS_DELAY_SECONDS = float(os.environ.get("ASK_TTS_DELAY_SECONDS", "0.18"))
+except ValueError:
+    DEFAULT_TTS_DELAY_SECONDS = 0.18
+DEFAULT_TTS_DELAY_SECONDS = max(0.1, min(0.3, DEFAULT_TTS_DELAY_SECONDS))
 
 COMMAND_ONLY_SYSTEM = """You are a Linux shell command generator.
-Return exactly one fenced sh code block containing only the command.
-No prose. No explanation. No bullets. No leading '$'.
+Output exactly one valid shell command.
+Do not include markdown.
+Do not include bullets or numbering.
+Do not include prose.
+Do not include a leading '$'.
 Assume zsh on Linux unless the user says otherwise.
 Prefer one command or one pipeline.
 """
 
-SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+SPINNER_STYLES: dict[str, list[str]] = {
+    "line": ["-", "\\", "|", "/"],
+    "dots": [".  ", ".. ", "...", " ..", "  .", "   "],
+    "bounce": [
+        "[=    ]",
+        "[==   ]",
+        "[ === ]",
+        "[  ===]",
+        "[   ==]",
+        "[    =]",
+        "[   ==]",
+        "[  ===]",
+        "[ === ]",
+        "[==   ]",
+    ],
+}
+FRESHNESS_HINTS = (
+    "latest",
+    "current",
+    "today",
+    "recent",
+    "recently",
+    "version",
+    "release notes",
+    "changelog",
+    "new api",
+    "updated docs",
+)
+TEXT_EXTENSIONS = {
+    ".adoc",
+    ".cfg",
+    ".conf",
+    ".ini",
+    ".json",
+    ".md",
+    ".markdown",
+    ".rst",
+    ".sh",
+    ".text",
+    ".toml",
+    ".txt",
+    ".xml",
+    ".yaml",
+    ".yml",
+}
+
+MAX_WEB_RESULTS = 5
+MAX_DOC_RESULTS = 5
+CHUNK_SIZE = 1400
+CHUNK_OVERLAP = 200
+
+
+@dataclass
+class SearchResult:
+    title: str
+    url: str
+    snippet: str
+
+
+@dataclass
+class DocChunk:
+    source: str
+    chunk_no: int
+    content: str
+    score: float
 
 
 def supports_color() -> bool:
@@ -33,127 +131,1248 @@ def color(text: str, code: str) -> str:
     return f"\033[{code}m{text}\033[0m"
 
 
-def spinner(stop_event: threading.Event, message: str) -> None:
-    i = 0
+def spinner(stop_event: threading.Event, message: str, frames: list[str]) -> None:
+    if not frames:
+        frames = SPINNER_STYLES["line"]
+
+    index = 0
+    max_frame_width = max(len(frame) for frame in frames)
     while not stop_event.is_set():
-        frame = SPINNER_FRAMES[i % len(SPINNER_FRAMES)]
+        frame = frames[index % len(frames)]
         sys.stderr.write(f"\r{color(frame, '36')} {message}")
         sys.stderr.flush()
-        time.sleep(0.08)
-        i += 1
+        time.sleep(0.1)
+        index += 1
 
-    sys.stderr.write("\r" + " " * (len(message) + 4) + "\r")
+    sys.stderr.write("\r" + " " * (len(message) + max_frame_width + 3) + "\r")
     sys.stderr.flush()
 
 
+def normalize_prompt_text(prompt_parts: list[str], stdin_text: str) -> str:
+    prompt = " ".join(prompt_parts).strip()
+    stdin_text = stdin_text.strip()
+
+    if stdin_text and prompt:
+        return (
+            "Use the following stdin content as additional context.\n\n"
+            f"{stdin_text}\n\n"
+            "User request:\n"
+            f"{prompt}"
+        )
+
+    if stdin_text:
+        return (
+            "Use the following stdin content as context. "
+            "If no explicit question is given, summarize the key points.\n\n"
+            f"{stdin_text}"
+        )
+
+    return prompt
+
+
 def extract_code_block(text: str) -> str:
-    match = re.search(r"```(?:\w+)?\n(.*?)```", text, re.DOTALL)
+    match = re.search(r"```(?:[\w.+-]+)?\n(.*?)```", text, re.DOTALL)
     if match:
         return match.group(1).strip()
     return text.strip()
 
 
 def clean_command_output(text: str) -> str:
-    text = extract_code_block(text).strip()
+    cleaned = extract_code_block(text).strip().strip("`")
 
-    # Remove a leading shell prompt if the model includes one
-    text = re.sub(r"^\$\s*", "", text)
+    def has_invalid_statement_syntax(line: str) -> bool:
+        # Model prose often includes these, while shell commands usually should not.
+        return "?" in line or "!" in line
 
-    # Strip stray backticks if present
-    text = text.strip("`").strip()
+    def shell_syntax_is_valid(line: str) -> bool:
+        try:
+            tokens = shlex.split(line, posix=True)
+        except ValueError:
+            return False
+        if not tokens:
+            return False
+        first = tokens[0]
+        return bool(re.match(r"^[A-Za-z0-9._/+~-]", first))
 
-    return text
+    lines: list[str] = []
+    for raw_line in cleaned.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        line = re.sub(r"^\$\s*", "", line)
+        line = re.sub(r"^(?:- |\* |\d+\.\s+)", "", line)
+        line = re.sub(r"^command\s*:\s*", "", line, flags=re.IGNORECASE)
+        line = line.strip("` ")
+
+        if line and not has_invalid_statement_syntax(line):
+            lines.append(line)
+
+    for candidate in lines:
+        if shell_syntax_is_valid(candidate):
+            return candidate.strip()
+
+    if lines:
+        sanitized = re.sub(r"[?!]+", "", lines[0]).strip()
+        if shell_syntax_is_valid(sanitized):
+            return sanitized
+
+    if not lines:
+        return ""
+
+    return re.sub(r"[?!]+", "", lines[0]).strip()
 
 
-def build_prompt(user_prompt: str, stdin_text: str) -> str:
-    user_prompt = user_prompt.strip()
-    stdin_text = stdin_text.strip()
-
-    if stdin_text and user_prompt:
-        return (
-            "Use the following stdin content as context.\n\n"
-            f"{stdin_text}\n\n"
-            "User request:\n"
-            f"{user_prompt}"
-        )
-    if stdin_text and not user_prompt:
-        return stdin_text
-    return user_prompt
+def looks_freshness_sensitive(text: str) -> bool:
+    lowered = text.lower()
+    return any(hint in lowered for hint in FRESHNESS_HINTS)
 
 
-def run_llm(
-    prompt: str,
-    model: str,
-    command_only: bool,
-    system_prompt: str,
-    show_spinner: bool,
-) -> int:
-    if not shutil.which("llm"):
-        sys.stderr.write("Error: `llm` is not installed or not on PATH.\n")
-        return 127
+def log_info(message: str) -> None:
+    sys.stderr.write(f"{message}\n")
 
-    cmd = ["llm", "-m", model, "--no-stream"]
 
-    if command_only:
-        cmd.append("-x")
+def get_config_file_path() -> Path:
+    return Path(DEFAULT_CONFIG_FILE).expanduser()
 
-    if system_prompt:
-        cmd.extend(["--system", system_prompt])
 
-    cmd.append(prompt)
-
-    stop_event = threading.Event()
-    spinner_thread = None
+def load_config(path: Path) -> dict[str, str]:
+    if not path.exists():
+        return {}
 
     try:
-        if show_spinner and sys.stderr.isatty():
-            label = f"Thinking with {model}"
-            spinner_thread = threading.Thread(
-                target=spinner, args=(stop_event, label), daemon=True
-            )
-            spinner_thread.start()
+        raw = path.read_text(encoding="utf-8")
+    except OSError:
+        return {}
 
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            check=False,
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+
+    if not isinstance(payload, dict):
+        return {}
+
+    normalized: dict[str, str] = {}
+    for key, value in payload.items():
+        if isinstance(key, str) and isinstance(value, str):
+            normalized[key] = value
+    return normalized
+
+
+def save_config(path: Path, payload: dict[str, str]) -> tuple[bool, str | None]:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        return True, None
+    except OSError as exc:
+        return False, str(exc)
+
+
+def resolve_default_model() -> str:
+    env_model = os.environ.get("ASK_MODEL", "").strip()
+    if env_model:
+        return env_model
+
+    config = load_config(get_config_file_path())
+    config_model = config.get("default_model", "").strip()
+    if config_model:
+        return config_model
+
+    return BUILTIN_DEFAULT_MODEL
+
+
+def persist_default_model(model: str) -> tuple[bool, str | None]:
+    path = get_config_file_path()
+    config = load_config(path)
+    config["default_model"] = model.strip()
+    return save_config(path, config)
+
+
+def resolve_power_model() -> str:
+    env_model = os.environ.get("ASK_POWER_MODEL", "").strip()
+    if env_model:
+        return env_model
+
+    config = load_config(get_config_file_path())
+    config_model = config.get("power_model", "").strip()
+    if config_model:
+        return config_model
+
+    return DEFAULT_POWER_MODEL
+
+
+def persist_power_model(model: str) -> tuple[bool, str | None]:
+    path = get_config_file_path()
+    config = load_config(path)
+    config["power_model"] = model.strip()
+    return save_config(path, config)
+
+
+def resolve_spinner_style() -> str:
+    env_style = os.environ.get("ASK_SPINNER_STYLE", "").strip().lower()
+    if env_style in SPINNER_STYLES:
+        return env_style
+
+    config = load_config(get_config_file_path())
+    config_style = config.get("spinner_style", "").strip().lower()
+    if config_style in SPINNER_STYLES:
+        return config_style
+
+    if DEFAULT_SPINNER_STYLE in SPINNER_STYLES:
+        return DEFAULT_SPINNER_STYLE
+    return "line"
+
+
+def persist_spinner_style(style: str) -> tuple[bool, str | None]:
+    cleaned = style.strip().lower()
+    if cleaned not in SPINNER_STYLES:
+        return False, f"Unknown spinner style: {style}"
+    path = get_config_file_path()
+    config = load_config(path)
+    config["spinner_style"] = cleaned
+    return save_config(path, config)
+
+
+def run_subprocess(cmd: list[str]) -> tuple[int, str, str]:
+    proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    return proc.returncode, proc.stdout, proc.stderr
+
+
+def _stop_process(proc: subprocess.Popen[bytes] | subprocess.Popen[str] | None, immediate: bool = False) -> None:
+    if proc is None or proc.poll() is not None:
+        return
+    try:
+        if immediate:
+            proc.kill()
+        else:
+            proc.terminate()
+    except OSError:
+        return
+    try:
+        proc.wait(timeout=0.3 if immediate else 1.0)
+    except subprocess.TimeoutExpired:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=0.3)
+        except subprocess.TimeoutExpired:
+            pass
+
+
+def speak(text: str) -> bool:
+    phrase = text.strip()
+    if not phrase:
+        return False
+
+    if not shutil.which("piper"):
+        log_info("[ask] TTS skipped: `piper` is not available on PATH.")
+        return False
+    if not shutil.which("aplay"):
+        log_info("[ask] TTS skipped: `aplay` is not available on PATH.")
+        return False
+
+    model_path = Path(DEFAULT_TTS_MODEL).expanduser()
+    if not model_path.is_file():
+        log_info(
+            f"[ask] TTS skipped: model not found at {model_path}. "
+            "Set ASK_TTS_MODEL to a valid Piper model path."
         )
+        return False
+
+    with AUDIO_PLAYBACK_LOCK:
+        try:
+            piper_proc = subprocess.Popen(
+                ["piper", "--model", str(model_path), "--output-raw"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            aplay_proc = subprocess.Popen(
+                ["aplay", "-r", DEFAULT_TTS_SAMPLE_RATE, "-f", "S16_LE", "-t", "raw", "-"],
+                stdin=piper_proc.stdout,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
+
+            if piper_proc.stdout is not None:
+                piper_proc.stdout.close()
+
+            if piper_proc.stdin is None:
+                log_info("[ask] TTS skipped: Piper stdin unavailable.")
+                return False
+            piper_proc.stdin.write((phrase + "\n").encode("utf-8"))
+            piper_proc.stdin.flush()
+            piper_proc.stdin.close()
+
+            piper_stderr = b""
+            if piper_proc.stderr is not None:
+                piper_stderr = piper_proc.stderr.read()
+            aplay_stderr = b""
+            if aplay_proc.stderr is not None:
+                aplay_stderr = aplay_proc.stderr.read()
+
+            piper_code = piper_proc.wait()
+            aplay_code = aplay_proc.wait()
+
+            if piper_code != 0:
+                detail = piper_stderr.decode("utf-8", errors="replace").strip()
+                log_info(f"[ask] TTS skipped: piper failed ({detail or 'exit code ' + str(piper_code)}).")
+                return False
+            if aplay_code != 0:
+                detail = aplay_stderr.decode("utf-8", errors="replace").strip()
+                log_info(f"[ask] TTS skipped: aplay failed ({detail or 'exit code ' + str(aplay_code)}).")
+                return False
+
+            return True
+        except OSError as exc:
+            log_info(f"[ask] TTS skipped: {exc}")
+            return False
+
+
+def _iter_tts_flush_chunks(text_iterator: Iterable[str]) -> Iterable[str]:
+    buffer = ""
+    carry = ""
+    min_flush = 120
+    max_flush = 260
+    min_chunk = 48
+
+    for piece in text_iterator:
+        if not piece:
+            continue
+        buffer += piece
+
+        while True:
+            flush_at = -1
+            terminal_match = None
+            for match in re.finditer(r"[.!?](?:\s|$)|\n", buffer):
+                terminal_match = match
+            if terminal_match and terminal_match.end() >= min_flush:
+                flush_at = terminal_match.end()
+            elif len(buffer) >= max_flush:
+                split_at = buffer.rfind(" ", 0, max_flush + 1)
+                if split_at <= 0:
+                    split_at = max_flush
+                flush_at = split_at
+
+            if flush_at <= 0:
+                break
+
+            chunk = buffer[:flush_at].strip()
+            buffer = buffer[flush_at:]
+            if chunk:
+                if carry:
+                    chunk = f"{carry} {chunk}".strip()
+                    carry = ""
+                if len(chunk) < min_chunk:
+                    carry = chunk
+                    continue
+                yield chunk
+
+    tail = f"{carry} {buffer.strip()}".strip()
+    if tail:
+        yield tail
+
+
+def stream_tts(text_iterator: Iterable[str], stop_event: threading.Event | None = None) -> bool:
+    if not shutil.which("piper"):
+        log_info("[ask] TTS skipped: `piper` is not available on PATH.")
+        return False
+    if not shutil.which("aplay"):
+        log_info("[ask] TTS skipped: `aplay` is not available on PATH.")
+        return False
+
+    model_path = Path(DEFAULT_TTS_MODEL).expanduser()
+    if not model_path.is_file():
+        log_info(
+            f"[ask] TTS skipped: model not found at {model_path}. "
+            "Set ASK_TTS_MODEL to a valid Piper model path."
+        )
+        return False
+
+    stop_signal = stop_event or threading.Event()
+    piper_proc: subprocess.Popen[bytes] | None = None
+    aplay_proc: subprocess.Popen[bytes] | None = None
+
+    with AUDIO_PLAYBACK_LOCK:
+        try:
+            piper_proc = subprocess.Popen(
+                ["piper", "--model", str(model_path), "--output-raw"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            aplay_proc = subprocess.Popen(
+                ["aplay", "-r", DEFAULT_TTS_SAMPLE_RATE, "-f", "S16_LE", "-t", "raw", "-"],
+                stdin=piper_proc.stdout,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
+
+            if piper_proc.stdout is not None:
+                piper_proc.stdout.close()
+            if piper_proc.stdin is None:
+                log_info("[ask] TTS skipped: Piper stdin unavailable.")
+                _stop_process(aplay_proc, immediate=True)
+                _stop_process(piper_proc, immediate=True)
+                return False
+
+            wrote_any = False
+            for chunk in _iter_tts_flush_chunks(text_iterator):
+                if stop_signal.is_set():
+                    break
+                payload = chunk.strip()
+                if not payload:
+                    continue
+                try:
+                    piper_proc.stdin.write((payload + "\n").encode("utf-8"))
+                    piper_proc.stdin.flush()
+                except (BrokenPipeError, OSError):
+                    stop_signal.set()
+                    break
+                wrote_any = True
+
+            if piper_proc.stdin is not None and not piper_proc.stdin.closed:
+                try:
+                    piper_proc.stdin.close()
+                except OSError:
+                    pass
+
+            if stop_signal.is_set():
+                _stop_process(aplay_proc, immediate=True)
+                _stop_process(piper_proc, immediate=True)
+                return wrote_any
+
+            piper_stderr = b""
+            if piper_proc.stderr is not None:
+                piper_stderr = piper_proc.stderr.read()
+            aplay_stderr = b""
+            if aplay_proc.stderr is not None:
+                aplay_stderr = aplay_proc.stderr.read()
+
+            piper_code = piper_proc.wait()
+            aplay_code = aplay_proc.wait()
+
+            if not wrote_any:
+                return False
+            if piper_code != 0:
+                detail = piper_stderr.decode("utf-8", errors="replace").strip()
+                log_info(f"[ask] TTS skipped: piper failed ({detail or 'exit code ' + str(piper_code)}).")
+                return False
+            if aplay_code != 0:
+                detail = aplay_stderr.decode("utf-8", errors="replace").strip()
+                log_info(f"[ask] TTS skipped: aplay failed ({detail or 'exit code ' + str(aplay_code)}).")
+                return False
+
+            return True
+        except OSError as exc:
+            log_info(f"[ask] TTS skipped: {exc}")
+            return False
+        finally:
+            if stop_signal.is_set():
+                _stop_process(aplay_proc, immediate=True)
+                _stop_process(piper_proc, immediate=True)
+
+
+def is_openai_model_name(model: str) -> bool:
+    lowered = model.strip().lower()
+    if lowered.startswith(("gpt-", "chatgpt-", "o1", "o3", "o4")):
+        return True
+    return lowered in {"4o", "4o-mini", "4.1", "4.1-mini", "4.1-nano", "gpt4", "4", "4t"}
+
+
+def infer_provider_from_model(model: str) -> str | None:
+    lowered = model.strip().lower()
+    if not lowered:
+        return None
+    if is_openai_model_name(lowered):
+        return "openai"
+    if lowered.startswith("claude"):
+        return "anthropic"
+    if lowered.startswith(("gemini", "models/gemini")):
+        return "google"
+    if lowered.startswith("mistral"):
+        return "mistral"
+    if lowered.startswith("groq"):
+        return "groq"
+    return None
+
+
+def provider_to_env_var(provider: str) -> str:
+    normalized = provider.strip().lower()
+    mapping = {
+        "openai": "OPENAI_API_KEY",
+        "anthropic": "ANTHROPIC_API_KEY",
+        "google": "GOOGLE_API_KEY",
+        "gemini": "GOOGLE_API_KEY",
+        "exa": "EXA_API_KEY",
+        "mistral": "MISTRAL_API_KEY",
+        "groq": "GROQ_API_KEY",
+        "openrouter": "OPENROUTER_API_KEY",
+        "cohere": "COHERE_API_KEY",
+        "huggingface": "HUGGINGFACE_API_KEY",
+        "hf": "HUGGINGFACE_API_KEY",
+    }
+    if normalized in mapping:
+        return mapping[normalized]
+    sanitized = re.sub(r"[^A-Za-z0-9]+", "_", normalized).upper().strip("_")
+    return f"{sanitized}_API_KEY" if sanitized else "API_KEY"
+
+
+def parse_missing_api_key_error(error_text: str) -> tuple[str | None, str | None]:
+    text = (error_text or "").strip()
+    if not text:
+        return None, None
+
+    provider_patterns = [
+        r"No key found for ['\"]?([A-Za-z0-9_.-]+)['\"]?",
+        r"No API key found for ['\"]?([A-Za-z0-9_.-]+)['\"]?",
+        r"Missing API key for ['\"]?([A-Za-z0-9_.-]+)['\"]?",
+        r"provider ['\"]?([A-Za-z0-9_.-]+)['\"]? requires an API key",
+    ]
+    for pattern in provider_patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            provider = match.group(1).strip().lower()
+            if provider:
+                return provider, provider_to_env_var(provider)
+
+    env_match = re.search(r"\b([A-Z][A-Z0-9_]*_API_KEY)\b", text)
+    if env_match:
+        env_var = env_match.group(1).strip().upper()
+        provider = env_var.removesuffix("_API_KEY").lower()
+        return provider, env_var
+
+    if "api key" in text.lower() and "not set" in text.lower():
+        return None, "API_KEY"
+
+    return None, None
+
+
+def maybe_setup_missing_api_key(error_text: str, model_hint: str = "") -> bool:
+    provider, env_var = parse_missing_api_key_error(error_text)
+
+    if not provider and not env_var:
+        inferred = infer_provider_from_model(model_hint)
+        if inferred:
+            provider = inferred
+            env_var = provider_to_env_var(inferred)
+        else:
+            return False
+
+    if not sys.stdin.isatty():
+        return False
+
+    label = provider or env_var or "unknown"
+    if not prompt_yes_no(f"API key appears missing ({label}). Set one now?", default_yes=False):
+        return False
+
+    key_value = getpass.getpass(f"Paste API key for {label} (blank to cancel): ").strip()
+    if not key_value:
+        log_info("[ask] Key setup cancelled (empty value).")
+        return False
+
+    if provider:
+        if shutil.which("llm"):
+            return_code, _, stderr = run_subprocess(["llm", "keys", "set", provider, "--value", key_value])
+            if return_code == 0:
+                log_info(f"[ask] Saved API key for '{provider}' in llm.")
+            else:
+                detail = stderr.strip() or "llm keys set returned a non-zero exit code"
+                log_info(f"[ask] Could not save llm key for '{provider}': {detail}")
+        else:
+            log_info("[ask] `llm` is not installed; skipping llm key store update.")
+
+    if env_var:
+        os.environ[env_var] = key_value
+        log_info(f"[ask] Exported {env_var} for this process.")
+        if prompt_yes_no("Print shell export command so you can copy/paste it?", default_yes=True):
+            log_info("Run this in your shell:")
+            log_info(f"export {env_var}={shlex.quote(key_value)}")
+
+    return True
+
+
+def parse_model_id_from_line(line: str) -> str:
+    match = re.match(r"^[^:]+:\s+([^\s(]+)", line.strip())
+    if not match:
+        return ""
+    return match.group(1).strip()
+
+
+def available_models() -> tuple[list[str], str | None]:
+    if not shutil.which("llm"):
+        return [], "`llm` is not installed or not on PATH"
+
+    return_code, stdout, stderr = run_subprocess(["llm", "models"])
+    if return_code != 0:
+        detail = stderr.strip() or "llm models returned a non-zero exit code"
+        return [], detail
+
+    models: list[str] = []
+    for line in stdout.splitlines():
+        model_id = parse_model_id_from_line(line)
+        if model_id and model_id not in models:
+            models.append(model_id)
+
+    if not models:
+        return [], "No models were returned by `llm models`"
+    return models, None
+
+
+def prompt_yes_no(question: str, default_yes: bool = False) -> bool:
+    suffix = " [Y/n]: " if default_yes else " [y/N]: "
+    answer = input(question + suffix).strip().lower()
+    if not answer:
+        return default_yes
+    return answer in {"y", "yes"}
+
+
+def clip_text(text: str, max_length: int) -> str:
+    if len(text) <= max_length:
+        return text
+    if max_length <= 3:
+        return text[:max_length]
+    return text[: max_length - 3] + "..."
+
+
+def model_ascii_card(model: str, title: str) -> str:
+    width = 68
+    inner_width = width - 4
+    family = "OpenAI" if is_openai_model_name(model) else "Local/Other"
+    power_eligible = "yes" if is_openai_model_name(model) else "no"
+
+    if is_openai_model_name(model):
+        art = [
+            "    ____   ____   _____   _   _    ___ ",
+            "   / __ \\ / __ \\ |  __ \\ | \\ | |  / _ \\",
+            "  | |  | | |  | || |__) ||  \\| | | | | |",
+            "  | |  | | |  | ||  ___/ | . ` | | | | |",
+            "  | |__| | |__| || |     | |\\  | | |_| |",
+            "   \\____/ \\____/ |_|     |_| \\_|  \\___/ ",
+        ]
+    else:
+        art = [
+            "        _                    _ ",
+            "       | |                  | |",
+            "   ___ | |  ___    ___  __ _| |",
+            "  / __|| | / _ \\  / __|/ _` | |",
+            "  \\__ \\| || (_) || (__| (_| | |",
+            "  |___/|_| \\___/  \\___|\\__,_|_|",
+        ]
+
+    def boxed_line(content: str = "") -> str:
+        return f"| {clip_text(content, inner_width).ljust(inner_width)} |"
+
+    lines = ["+" + "-" * (width - 2) + "+"]
+    lines.append(boxed_line(title))
+    lines.append(boxed_line(f"Model          : {model}"))
+    lines.append(boxed_line(f"Family         : {family}"))
+    lines.append(boxed_line(f"Power eligible : {power_eligible}"))
+    lines.append(boxed_line())
+    for line in art:
+        lines.append(boxed_line(line))
+    lines.append("+" + "-" * (width - 2) + "+")
+    return "\n".join(lines)
+
+
+def interactive_model_selection() -> tuple[str, bool]:
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        raise RuntimeError("--model-select/--select-model requires an interactive terminal")
+
+    models, error = available_models()
+    if error:
+        raise RuntimeError(f"Could not read models from `llm`: {error}")
+
+    current_default_model = resolve_default_model()
+    print("\n" + model_ascii_card(current_default_model, "Current Selected Model"))
+
+    filter_text = input("Model filter (blank for all): ").strip().lower()
+    visible = [model for model in models if filter_text in model.lower()] if filter_text else models
+    if not visible:
+        raise RuntimeError("No models matched the selected filter")
+
+    print("\nAvailable models:")
+    for idx, model in enumerate(visible, start=1):
+        print(f"{idx:3d}. {model}")
+
+    selection_text = input("\nSelect model number: ").strip()
+    if not selection_text.isdigit():
+        raise RuntimeError("Model selection must be a numeric choice")
+
+    selection_index = int(selection_text)
+    if selection_index < 1 or selection_index > len(visible):
+        raise RuntimeError("Selected model number is out of range")
+
+    selected_model = visible[selection_index - 1]
+    print("\n" + model_ascii_card(selected_model, "New Selected Model"))
+    print(f"[ask] Selected model: {selected_model}")
+
+    default_provider = infer_provider_from_model(selected_model) or "openai"
+    provider = input(
+        f"Provider key name for API key (blank to skip, default: {default_provider}): "
+    ).strip()
+    if not provider:
+        provider = default_provider
+
+    key_value = getpass.getpass(f"Paste API key for '{provider}' (blank to skip): ").strip()
+    key_set = False
+    if key_value:
+        return_code, _, stderr = run_subprocess(["llm", "keys", "set", provider, "--value", key_value])
+        if return_code != 0:
+            detail = stderr.strip() or "llm keys set returned a non-zero exit code"
+            raise RuntimeError(f"Could not save API key: {detail}")
+        key_set = True
+        print(f"[ask] Saved API key for '{provider}'.")
+
+    return selected_model, key_set
+
+
+def execute_generated_command(command: str) -> int:
+    if not sys.stdin.isatty():
+        sys.stderr.write("Error: --no-output requires interactive confirmation on a TTY.\n")
+        return 2
+
+    sys.stderr.write(
+        "[ask] Confirmation required: this command will execute directly and may modify files.\n"
+    )
+    sys.stderr.write(f"[ask] Command: {command}\n")
+    if not prompt_yes_no("Execute command now?", default_yes=False):
+        sys.stderr.write("[ask] Command execution cancelled.\n")
+        return 1
+
+    shell = os.environ.get("SHELL", "/bin/zsh")
+    proc = subprocess.run(
+        command,
+        shell=True,
+        executable=shell,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    if proc.returncode == 0:
+        sys.stderr.write("[ask] Command executed successfully.\n")
+        return 0
+
+    stderr = proc.stderr.strip()
+    if stderr:
+        sys.stderr.write(stderr + "\n")
+    sys.stderr.write(f"[ask] Command failed with exit code {proc.returncode}.\n")
+    return proc.returncode
+
+
+def search_web_exa(query: str, max_results: int = MAX_WEB_RESULTS) -> tuple[list[SearchResult], str | None]:
+    api_key = os.environ.get("EXA_API_KEY", "").strip()
+    if not api_key:
+        return [], "EXA_API_KEY is not set"
+
+    payload = {
+        "query": query,
+        "numResults": max_results,
+        "type": "auto",
+        "contents": {"text": {"maxCharacters": 800}},
+    }
+
+    request = urllib.request.Request(
+        "https://api.exa.ai/search",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "x-api-key": api_key,
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            body = response.read().decode("utf-8")
+    except urllib.error.URLError as exc:
+        return [], f"Exa request failed: {exc}"
+    except TimeoutError:
+        return [], "Exa request timed out"
+
+    try:
+        payload_obj = json.loads(body)
+    except json.JSONDecodeError:
+        return [], "Exa returned non-JSON output"
+
+    results: list[SearchResult] = []
+    for item in payload_obj.get("results", []):
+        title = (item.get("title") or "Untitled").strip()
+        url = (item.get("url") or "").strip()
+        snippet = (item.get("text") or "").strip()
+        if not snippet and item.get("highlights"):
+            highlights = item.get("highlights")
+            if isinstance(highlights, list):
+                snippet = " ".join(str(part).strip() for part in highlights if str(part).strip())
+
+        if url:
+            results.append(SearchResult(title=title, url=url, snippet=snippet[:1200]))
+
+    if not results:
+        return [], "Exa returned no results"
+
+    return results, None
+
+
+def search_web_ddgr(query: str, max_results: int = MAX_WEB_RESULTS) -> tuple[list[SearchResult], str | None]:
+    if not shutil.which("ddgr"):
+        return [], "ddgr is not installed"
+
+    return_code, stdout, stderr = run_subprocess(
+        ["ddgr", "--json", "-n", str(max_results), query]
+    )
+
+    if return_code != 0:
+        detail = stderr.strip() or "ddgr returned a non-zero exit code"
+        return [], detail
+
+    try:
+        payload_obj = json.loads(stdout)
+    except json.JSONDecodeError:
+        return [], "ddgr returned non-JSON output"
+
+    results: list[SearchResult] = []
+    for item in payload_obj:
+        title = str(item.get("title", "Untitled")).strip()
+        url = str(item.get("url", "")).strip()
+        snippet = str(item.get("abstract", "")).strip()
+        if url:
+            results.append(SearchResult(title=title, url=url, snippet=snippet[:1200]))
+
+    if not results:
+        return [], "ddgr returned no results"
+
+    return results, None
+
+
+def search_web(query: str, provider: str) -> tuple[list[SearchResult], str, str | None]:
+    chosen = provider.lower()
+
+    if chosen not in {"auto", "exa", "ddgr"}:
+        return [], chosen, f"Unknown web provider: {provider}"
+
+    errors: list[str] = []
+
+    if chosen in {"auto", "exa"}:
+        results, error = search_web_exa(query)
+        if results:
+            return results, "exa", None
+        if error:
+            errors.append(f"exa: {error}")
+        if chosen == "exa":
+            return [], "exa", "; ".join(errors)
+
+    if chosen in {"auto", "ddgr"}:
+        results, error = search_web_ddgr(query)
+        if results:
+            return results, "ddgr", None
+        if error:
+            errors.append(f"ddgr: {error}")
+        if chosen == "ddgr":
+            return [], "ddgr", "; ".join(errors)
+
+    return [], "auto", "; ".join(errors) if errors else "No web provider available"
+
+
+def format_web_context(results: list[SearchResult]) -> str:
+    lines: list[str] = []
+    for idx, result in enumerate(results, start=1):
+        lines.append(f"[{idx}] {result.title}")
+        lines.append(f"URL: {result.url}")
+        if result.snippet:
+            lines.append(f"Snippet: {result.snippet}")
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
+def discover_doc_files(collection_dir: Path) -> list[Path]:
+    files: list[Path] = []
+    for root, dirs, filenames in os.walk(collection_dir):
+        dirs[:] = [name for name in dirs if name != ".index" and not name.startswith(".")]
+
+        for filename in filenames:
+            file_path = Path(root) / filename
+
+            if filename.startswith("."):
+                continue
+
+            extension = file_path.suffix.lower()
+            if extension in TEXT_EXTENSIONS or extension == "":
+                files.append(file_path)
+
+    files.sort()
+    return files
+
+
+def safe_read_text(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return ""
+
+
+def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> list[str]:
+    cleaned = text.strip()
+    if not cleaned:
+        return []
+
+    chunks: list[str] = []
+    start = 0
+    text_len = len(cleaned)
+
+    while start < text_len:
+        end = min(start + chunk_size, text_len)
+        candidate = cleaned[start:end]
+
+        if end < text_len:
+            newline_cutoff = candidate.rfind("\n")
+            if newline_cutoff > chunk_size // 2:
+                end = start + newline_cutoff
+                candidate = cleaned[start:end]
+
+        chunk = candidate.strip()
+        if chunk:
+            chunks.append(chunk)
+
+        if end >= text_len:
+            break
+
+        start = max(end - overlap, start + 1)
+
+    return chunks
+
+
+def collection_signature(files: list[Path], root: Path) -> str:
+    hasher = hashlib.sha256()
+    for path in files:
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        rel_path = str(path.relative_to(root))
+        hasher.update(rel_path.encode("utf-8", errors="ignore"))
+        hasher.update(str(stat.st_mtime_ns).encode("ascii", errors="ignore"))
+        hasher.update(str(stat.st_size).encode("ascii", errors="ignore"))
+    return hasher.hexdigest()
+
+
+def open_docs_db(db_path: Path) -> sqlite3.Connection:
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(db_path)
+    connection.execute("PRAGMA journal_mode=WAL")
+    connection.execute("PRAGMA synchronous=NORMAL")
+    return connection
+
+
+def initialize_docs_db(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS docs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source TEXT NOT NULL,
+            chunk_no INTEGER NOT NULL,
+            content TEXT NOT NULL
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+        """
+    )
+    connection.commit()
+
+
+def get_meta(connection: sqlite3.Connection, key: str) -> str:
+    row = connection.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+    return row[0] if row else ""
+
+
+def set_meta(connection: sqlite3.Connection, key: str, value: str) -> None:
+    connection.execute(
+        "INSERT INTO meta(key, value) VALUES(?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (key, value),
+    )
+
+
+def rebuild_docs_index(
+    connection: sqlite3.Connection,
+    files: list[Path],
+    collection_root: Path,
+    signature: str,
+) -> int:
+    connection.execute("DELETE FROM docs")
+
+    inserted = 0
+    for file_path in files:
+        text = safe_read_text(file_path)
+        if not text.strip():
+            continue
+
+        relative_source = str(file_path.relative_to(collection_root))
+        chunks = chunk_text(text)
+
+        for chunk_no, chunk in enumerate(chunks):
+            connection.execute(
+                "INSERT INTO docs(source, chunk_no, content) VALUES(?, ?, ?)",
+                (relative_source, chunk_no, chunk),
+            )
+            inserted += 1
+
+    connection.execute("DROP TABLE IF EXISTS docs_fts")
+    fts_enabled = "0"
+
+    try:
+        connection.execute(
+            "CREATE VIRTUAL TABLE docs_fts USING fts5(content, source UNINDEXED, chunk_no UNINDEXED)"
+        )
+        connection.execute(
+            "INSERT INTO docs_fts(rowid, content, source, chunk_no) "
+            "SELECT id, content, source, chunk_no FROM docs"
+        )
+        fts_enabled = "1"
+    except sqlite3.OperationalError:
+        fts_enabled = "0"
+
+    set_meta(connection, "signature", signature)
+    set_meta(connection, "fts_enabled", fts_enabled)
+    connection.commit()
+    return inserted
+
+
+def tokenize_query(text: str) -> list[str]:
+    tokens = re.findall(r"[a-zA-Z0-9_:+.-]{2,}", text.lower())
+    seen: set[str] = set()
+    unique_tokens: list[str] = []
+    for token in tokens:
+        if token not in seen:
+            unique_tokens.append(token)
+            seen.add(token)
+    return unique_tokens
+
+
+def build_fts_query(query: str) -> str:
+    tokens = tokenize_query(query)
+    if not tokens:
+        return query.strip()
+    quoted = [f'"{token}"' for token in tokens[:12]]
+    return " OR ".join(quoted)
+
+
+def lexical_rank(rows: Iterable[tuple[str, int, str]], query: str, limit: int) -> list[DocChunk]:
+    tokens = tokenize_query(query)
+    if not tokens:
+        return []
+
+    ranked: list[DocChunk] = []
+    for source, chunk_no, content in rows:
+        lowered = content.lower()
+        score = 0.0
+        for token in tokens:
+            if token in lowered:
+                score += lowered.count(token)
+        if score > 0:
+            ranked.append(DocChunk(source=source, chunk_no=chunk_no, content=content, score=score))
+
+    ranked.sort(key=lambda item: item.score, reverse=True)
+    return ranked[:limit]
+
+
+def search_docs_collection(
+    collection: str,
+    docs_root: Path,
+    query: str,
+    limit: int = MAX_DOC_RESULTS,
+) -> tuple[list[DocChunk], str | None]:
+    collection_dir = docs_root / collection
+    if not collection_dir.exists() or not collection_dir.is_dir():
+        return [], f"Docs collection '{collection}' not found at {collection_dir}"
+
+    files = discover_doc_files(collection_dir)
+    if not files:
+        return [], f"Docs collection '{collection}' has no readable text files"
+
+    signature = collection_signature(files, collection_dir)
+    db_path = docs_root / ".index" / f"{collection}.sqlite3"
+
+    connection = open_docs_db(db_path)
+    try:
+        initialize_docs_db(connection)
+        stored_signature = get_meta(connection, "signature")
+        docs_count_row = connection.execute("SELECT COUNT(*) FROM docs").fetchone()
+        docs_count = int(docs_count_row[0]) if docs_count_row else 0
+
+        if stored_signature != signature or docs_count == 0:
+            indexed = rebuild_docs_index(connection, files, collection_dir, signature)
+            if indexed == 0:
+                return [], f"Docs collection '{collection}' produced no searchable chunks"
+
+        fts_enabled = get_meta(connection, "fts_enabled") == "1"
+
+        if fts_enabled:
+            fts_query = build_fts_query(query)
+            try:
+                rows = connection.execute(
+                    "SELECT source, chunk_no, content, bm25(docs_fts) AS score "
+                    "FROM docs_fts WHERE docs_fts MATCH ? ORDER BY score LIMIT ?",
+                    (fts_query, limit),
+                ).fetchall()
+            except sqlite3.OperationalError:
+                rows = []
+
+            chunks: list[DocChunk] = [
+                DocChunk(source=row[0], chunk_no=int(row[1]), content=row[2], score=float(row[3]))
+                for row in rows
+            ]
+
+            if chunks:
+                return chunks, None
+
+        plain_rows = connection.execute(
+            "SELECT source, chunk_no, content FROM docs"
+        ).fetchall()
+        ranked = lexical_rank(plain_rows, query, limit)
+
+        if ranked:
+            return ranked, None
+
+        return [], f"No relevant documentation chunks found in collection '{collection}'"
 
     finally:
-        stop_event.set()
-        if spinner_thread is not None:
-            spinner_thread.join()
+        connection.close()
 
-    if proc.returncode != 0:
-        sys.stderr.write(proc.stderr or "Unknown llm error\n")
-        return proc.returncode
 
-    output = proc.stdout.strip()
+def format_docs_context(chunks: list[DocChunk], collection: str) -> str:
+    lines: list[str] = [f"Collection: {collection}"]
+    for idx, chunk in enumerate(chunks, start=1):
+        lines.append(f"[{idx}] Source: {chunk.source} (chunk {chunk.chunk_no})")
+        lines.append(chunk.content.strip())
+        lines.append("")
+    return "\n".join(lines).strip()
 
-    if command_only:
-        output = clean_command_output(output)
 
-    sys.stdout.write(output + ("\n" if output and not output.endswith("\n") else ""))
-    return 0
+def find_first_collection(docs_root: Path) -> str:
+    if not docs_root.exists() or not docs_root.is_dir():
+        return ""
+
+    entries = []
+    for child in docs_root.iterdir():
+        if child.is_dir() and child.name != ".index" and not child.name.startswith("."):
+            entries.append(child.name)
+
+    entries.sort()
+    return entries[0] if entries else ""
+
+
+def build_grounded_prompt(user_prompt: str, context_text: str, context_kind: str) -> str:
+    context_label = "web search results" if context_kind == "web" else "local documentation"
+
+    return (
+        f"You must answer using only the provided {context_label}.\n"
+        "If the answer is not supported by the context, reply exactly with: "
+        "'I don't have enough grounded context to answer that.'\n"
+        "Prefer exact option names, command flags, API names, and code snippets when present.\n\n"
+        "Grounding context:\n"
+        f"{context_text}\n\n"
+        "User request:\n"
+        f"{user_prompt.strip()}"
+    )
 
 
 def parse_args() -> argparse.Namespace:
+    default_model = resolve_default_model()
+    default_spinner_style = resolve_spinner_style()
+
     parser = argparse.ArgumentParser(
-        prog="askllm",
-        description="CLI wrapper around `llm` with command-only mode and spinner.",
+        prog="ask",
+        description="Local-first wrapper around `llm` with command-only mode and optional retrieval grounding.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Implementations:\n"
+            "  --web  : wrapper-controlled retrieval (provider auto->exa->ddgr)\n"
+            "  --docs : lightweight local docs retrieval with SQLite indexing\n"
+            "  --auto : heuristic routing (freshness prompts -> web, otherwise docs)\n\n"
+            "Default model selection:\n"
+            "  -m/--model overrides for current command\n"
+            "  -ms/--model-select opens interactive model selection\n"
+            "  -sm/--select-model does the same thing (alias)\n"
+            "  -ms MODEL (or -sm MODEL) persists default model directly in ~/.config/askllm/config.json\n\n"
+            "Power/OpenAI model flow:\n"
+            "  -pc/--power-config stores your OpenAI power model\n"
+            "  -p/--power uses that stored power model for current command\n"
+            "  -ms/--model-select and -sm/--select-model open the same interactive picker\n\n"
+            "API key handling:\n"
+            "  on missing-key errors, ask can prompt you to paste/set a key and retry\n"
+            "  ask can print an export command for quick copy/paste\n\n"
+            "Spinner styles:\n"
+            "  --spinner-style selects animation for this run\n"
+            "  --spinner-style-select saves default spinner style\n\n"
+            "TTS:\n"
+            "  --tts speaks the final output using Piper\n"
+            "  --tts-configure stream|full selects live streaming or post-generation TTS\n"
+            "  configure ASK_TTS_MODEL for the Piper model path\n\n"
+            "Prompt escaping:\n"
+            "  quote prompts containing shell wildcard characters (?, *, [, ], !)\n"
+            "  example: ask --web \"what day is it?\"\n\n"
+            "Examples:\n"
+            "  ask \"Explain rsync -avz\"\n"
+            "  ask -co \"find the 20 largest files\"\n"
+            "  ask -ms\n"
+            "  ask -ms llama3.2:3b\n"
+            "  ask -pc gpt-5.4 && ask -p \"plan my migration\"\n"
+            "  ask --spinner-style dots \"explain rsync\"\n"
+            "  ask --tts \"summarize this\"\n"
+            "  ask --tts --tts-configure stream \"summarize this\"\n"
+            "  ask --web \"latest bun install instructions\"\n"
+            "  ask --docs mydocs \"how do vite path aliases work\"\n"
+            "  cat package.json | ask -co \"write a jq command for dependencies\""
+        ),
     )
+
     parser.add_argument(
         "-co",
         "--command-only",
         action="store_true",
-        help="Output only the command.",
+        help="Generate a single shell command only. Does not execute it.",
     )
     parser.add_argument(
         "-m",
         "--model",
-        default=DEFAULT_MODEL,
-        help=f"Model to use (default: {DEFAULT_MODEL})",
+        default="",
+        help=f"Model for this invocation (default: {default_model}).",
+    )
+    parser.add_argument(
+        "-sm",
+        "--select-model",
+        "-ms",
+        "--model-select",
+        dest="model_select",
+        nargs="?",
+        const=MODEL_SELECT_INTERACTIVE_SENTINEL,
+        metavar="MODEL",
+        default="",
+        help="Open interactive model selection, or pass MODEL to persist directly (both flags are aliases).",
+    )
+    parser.add_argument(
+        "-p",
+        "--power",
+        action="store_true",
+        help="Use the configured OpenAI power model for this invocation.",
+    )
+    parser.add_argument(
+        "-pc",
+        "--power-config",
+        metavar="MODEL",
+        default="",
+        help="Persist MODEL as your OpenAI power model.",
     )
     parser.add_argument(
         "-s",
@@ -164,40 +1383,488 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--no-spinner",
         action="store_true",
-        help="Disable loading animation.",
+        help="Disable spinner animation.",
     )
     parser.add_argument(
-        "prompt",
-        nargs="*",
-        help="Prompt text.",
+        "--spinner-style",
+        choices=sorted(SPINNER_STYLES.keys()),
+        default="",
+        help=f"Spinner animation for this run (default: {default_spinner_style}).",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--spinner-style-select",
+        choices=sorted(SPINNER_STYLES.keys()),
+        default="",
+        help="Persist default spinner animation for future runs.",
+    )
+    parser.add_argument(
+        "--tts",
+        action="store_true",
+        help="Speak final output text via Piper + aplay (set ASK_TTS_MODEL for model path).",
+    )
+    parser.add_argument(
+        "--tts-configure",
+        choices=["full", "stream"],
+        default=DEFAULT_TTS_MODE,
+        help=f"TTS mode when --tts is enabled (default: {DEFAULT_TTS_MODE}).",
+    )
+    parser.add_argument(
+        "-no",
+        "--no-output",
+        action="store_true",
+        help="Execute generated command directly (with confirmation) and suppress command text output.",
+    )
+    parser.add_argument(
+        "--web",
+        action="store_true",
+        help="Retrieve web context first, then ground the model response on that context.",
+    )
+    parser.add_argument(
+        "--web-provider",
+        default=DEFAULT_WEB_PROVIDER,
+        choices=["auto", "exa", "ddgr"],
+        help=f"Web provider implementation (default: {DEFAULT_WEB_PROVIDER}).",
+    )
+    parser.add_argument(
+        "--docs",
+        metavar="COLLECTION",
+        help="Use local documentation collection for retrieval grounding.",
+    )
+    parser.add_argument(
+        "--docs-db",
+        default=DEFAULT_DOCS_DB,
+        help=f"Docs root containing collections (default: {DEFAULT_DOCS_DB}).",
+    )
+    parser.add_argument(
+        "--auto",
+        action="store_true",
+        help="Auto-route retrieval: freshness-sensitive prompts prefer web, otherwise docs if available.",
+    )
+    parser.add_argument("prompt", nargs="*", help="Prompt text.")
+
+    args = parser.parse_args()
+
+    if args.web and args.auto:
+        parser.error("--web and --auto cannot be used together")
+    if args.no_output and not args.command_only:
+        parser.error("-no/--no-output can only be used with -co/--command-only")
+    if args.power and args.model.strip():
+        parser.error("--power cannot be combined with --model; choose one")
+    if args.power_config and not is_openai_model_name(args.power_config):
+        parser.error("--power-config must be an OpenAI model (for example: gpt-5.4)")
+
+    return args
+
+
+def resolve_mode(
+    prompt: str,
+    args: argparse.Namespace,
+    docs_root: Path,
+) -> tuple[str, str]:
+    if args.web:
+        return "web", ""
+
+    if args.docs and not args.auto:
+        return "docs", args.docs
+
+    if args.auto:
+        if looks_freshness_sensitive(prompt):
+            return "web", ""
+
+        collection = args.docs or DEFAULT_DOCS_COLLECTION or find_first_collection(docs_root)
+        if collection:
+            return "docs", collection
+
+        return "none", ""
+
+    return "none", ""
+
+
+def run_llm(
+    prompt: str,
+    model: str,
+    system_prompt: str,
+    show_spinner: bool,
+    spinner_style: str,
+) -> tuple[int, str, str]:
+    if not shutil.which("llm"):
+        return 127, "", "Error: `llm` is not installed or not on PATH."
+
+    cmd = ["llm", "-m", model, "--no-stream"]
+    if system_prompt:
+        cmd.extend(["--system", system_prompt])
+    cmd.append(prompt)
+
+    stop_event = threading.Event()
+    spinner_thread: threading.Thread | None = None
+    spinner_frames = SPINNER_STYLES.get(spinner_style, SPINNER_STYLES["line"])
+
+    try:
+        if show_spinner and sys.stderr.isatty():
+            spinner_thread = threading.Thread(
+                target=spinner,
+                args=(stop_event, f"Thinking with {model}", spinner_frames),
+                daemon=True,
+            )
+            spinner_thread.start()
+
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    finally:
+        stop_event.set()
+        if spinner_thread is not None:
+            spinner_thread.join()
+
+    return proc.returncode, proc.stdout, proc.stderr
+
+
+def run_llm_stream(
+    prompt: str,
+    model: str,
+    system_prompt: str,
+    show_spinner: bool,
+    spinner_style: str,
+    emit_stdout: bool,
+    enable_stream_tts: bool,
+) -> tuple[int, str, str]:
+    if not shutil.which("llm"):
+        return 127, "", "Error: `llm` is not installed or not on PATH."
+
+    cmd = ["llm", "-m", model]
+    if system_prompt:
+        cmd.extend(["--system", system_prompt])
+    cmd.append(prompt)
+
+    stop_event = threading.Event()
+    spinner_thread: threading.Thread | None = None
+    spinner_frames = SPINNER_STYLES.get(spinner_style, SPINNER_STYLES["line"])
+
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+
+    tts_queue: queue.Queue[str | None] | None = None
+    tts_thread: threading.Thread | None = None
+    tts_stop_event: threading.Event | None = None
+    if enable_stream_tts:
+        model_path = Path(DEFAULT_TTS_MODEL).expanduser()
+        if not shutil.which("piper"):
+            log_info("[ask] TTS skipped: `piper` is not available on PATH.")
+            enable_stream_tts = False
+        elif not shutil.which("aplay"):
+            log_info("[ask] TTS skipped: `aplay` is not available on PATH.")
+            enable_stream_tts = False
+        elif not model_path.is_file():
+            log_info(
+                f"[ask] TTS skipped: model not found at {model_path}. "
+                "Set ASK_TTS_MODEL to a valid Piper model path."
+            )
+            enable_stream_tts = False
+
+    if enable_stream_tts:
+        tts_queue = queue.Queue(maxsize=4096)
+        tts_stop_event = threading.Event()
+
+        def _queue_iterator() -> Iterable[str]:
+            pending = ""
+            while True:
+                if tts_stop_event is not None and tts_stop_event.is_set():
+                    break
+                try:
+                    item = tts_queue.get(timeout=DEFAULT_TTS_DELAY_SECONDS)
+                except queue.Empty:
+                    if pending:
+                        yield pending
+                        pending = ""
+                    continue
+                if item is None:
+                    break
+                pending += item
+                if any(mark in item for mark in ".!?\n") and len(pending) >= 24:
+                    yield pending
+                    pending = ""
+                    continue
+                if len(pending) >= 240:
+                    yield pending
+                    pending = ""
+            if pending:
+                yield pending
+
+        tts_thread = threading.Thread(
+            target=stream_tts,
+            args=(_queue_iterator(), tts_stop_event),
+            daemon=True,
+        )
+        tts_thread.start()
+
+    output_parts: list[str] = []
+
+    try:
+        if show_spinner and sys.stderr.isatty():
+            spinner_thread = threading.Thread(
+                target=spinner,
+                args=(stop_event, f"Thinking with {model}", spinner_frames),
+                daemon=True,
+            )
+            spinner_thread.start()
+
+        if proc.stdout is not None:
+            while True:
+                chunk = proc.stdout.read(1)
+                if chunk == "":
+                    break
+                output_parts.append(chunk)
+                if emit_stdout:
+                    sys.stdout.write(chunk)
+                    sys.stdout.flush()
+                if tts_queue is not None:
+                    if tts_thread is not None and not tts_thread.is_alive():
+                        tts_queue = None
+                    else:
+                        try:
+                            tts_queue.put_nowait(chunk)
+                        except queue.Full:
+                            pass
+    except KeyboardInterrupt:
+        if tts_stop_event is not None:
+            tts_stop_event.set()
+        _stop_process(proc, immediate=True)
+        raise
+    finally:
+        stop_event.set()
+        if spinner_thread is not None:
+            spinner_thread.join()
+        if tts_stop_event is not None:
+            tts_stop_event.set()
+        if tts_queue is not None:
+            try:
+                tts_queue.put_nowait(None)
+            except queue.Full:
+                try:
+                    tts_queue.get_nowait()
+                    tts_queue.put_nowait(None)
+                except (queue.Empty, queue.Full):
+                    pass
+        if tts_thread is not None:
+            tts_thread.join(timeout=5)
+
+    stderr_text = ""
+    if proc.stderr is not None:
+        stderr_text = proc.stderr.read()
+    return_code = proc.wait()
+    output_text = "".join(output_parts)
+
+    if emit_stdout and output_text and not output_text.endswith("\n"):
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+
+    return return_code, output_text, stderr_text
 
 
 def main() -> int:
     args = parse_args()
 
-    stdin_text = ""
-    if not sys.stdin.isatty():
-        stdin_text = sys.stdin.read()
+    model = args.model.strip() or resolve_default_model()
+    spinner_style = args.spinner_style.strip().lower() or resolve_spinner_style()
+    did_configuration = False
 
-    user_prompt = " ".join(args.prompt).strip()
-    prompt = build_prompt(user_prompt, stdin_text)
+    interactive_model_select = args.model_select == MODEL_SELECT_INTERACTIVE_SENTINEL
 
-    if not prompt:
+    if interactive_model_select:
+        selected_model, _ = interactive_model_selection()
+        ok, error = persist_default_model(selected_model)
+        if not ok:
+            sys.stderr.write(f"Error: could not persist selected model ({error}).\n")
+            return 2
+        log_info(f"[ask] Default model set to '{selected_model}'.")
+        model = selected_model
+        did_configuration = True
+
+        if is_openai_model_name(selected_model) and prompt_yes_no(
+            "Also save this as your power model?", default_yes=False
+        ):
+            ok, error = persist_power_model(selected_model)
+            if not ok:
+                sys.stderr.write(f"Error: could not persist power model ({error}).\n")
+                return 2
+            log_info(f"[ask] Power model set to '{selected_model}'.")
+        elif not is_openai_model_name(selected_model):
+            log_info("[ask] Selected model is non-OpenAI; it was not set as power model.")
+
+    if args.model_select and args.model_select != MODEL_SELECT_INTERACTIVE_SENTINEL:
+        selected_model = args.model_select.strip()
+        if not selected_model:
+            sys.stderr.write("Error: --model-select requires a non-empty model name.\n")
+            return 2
+
+        ok, error = persist_default_model(selected_model)
+        if not ok:
+            sys.stderr.write(f"Error: could not persist model selection ({error}).\n")
+            return 2
+
+        log_info(f"[ask] Default model set to '{selected_model}'.")
+        if not args.model.strip():
+            model = selected_model
+        did_configuration = True
+
+    if args.power_config:
+        configured_power_model = args.power_config.strip()
+        ok, error = persist_power_model(configured_power_model)
+        if not ok:
+            sys.stderr.write(f"Error: could not persist power model ({error}).\n")
+            return 2
+        log_info(f"[ask] Power model set to '{configured_power_model}'.")
+        did_configuration = True
+
+    if args.spinner_style_select:
+        selected_spinner_style = args.spinner_style_select.strip().lower()
+        ok, error = persist_spinner_style(selected_spinner_style)
+        if not ok:
+            sys.stderr.write(f"Error: could not persist spinner style ({error}).\n")
+            return 2
+        spinner_style = selected_spinner_style
+        log_info(f"[ask] Spinner style set to '{selected_spinner_style}'.")
+        did_configuration = True
+
+    if args.power:
+        model = resolve_power_model()
+        if not is_openai_model_name(model):
+            sys.stderr.write(
+                "Error: configured power model is not OpenAI-based. "
+                "Use --power-config with an OpenAI model (for example: gpt-5.4).\n"
+            )
+            return 2
+        log_info(f"[ask] Using power model '{model}'.")
+
+    if did_configuration and not args.prompt:
+        return 0
+
+    stdin_text = sys.stdin.read() if not sys.stdin.isatty() else ""
+    base_prompt = normalize_prompt_text(args.prompt, stdin_text)
+
+    if not base_prompt.strip():
         sys.stderr.write("Usage: ask [options] \"your prompt here\"\n")
         return 2
 
-    system_prompt = COMMAND_ONLY_SYSTEM if args.command_only else args.system
+    docs_root = Path(args.docs_db).expanduser()
+    mode, docs_collection = resolve_mode(base_prompt, args, docs_root)
 
-    return run_llm(
-        prompt=prompt,
-        model=args.model,
-        command_only=args.command_only,
-        system_prompt=system_prompt,
-        show_spinner=not args.no_spinner,
-    )
+    final_prompt = base_prompt
+
+    if mode == "web":
+        log_info("[ask] Retrieving web context...")
+        results, provider, error = search_web(base_prompt, args.web_provider)
+        if error:
+            if maybe_setup_missing_api_key(error):
+                log_info("[ask] Retrying web retrieval after key setup...")
+                results, provider, error = search_web(base_prompt, args.web_provider)
+            if error:
+                sys.stderr.write(f"Error: web augmentation unavailable ({error}).\n")
+                return 3
+
+        context_text = format_web_context(results)
+        final_prompt = build_grounded_prompt(base_prompt, context_text, "web")
+        log_info(f"[ask] Web grounding enabled via {provider} ({len(results)} results).")
+
+    elif mode == "docs":
+        if not docs_collection:
+            sys.stderr.write("Error: docs mode requires a collection name.\n")
+            return 2
+
+        log_info(f"[ask] Retrieving docs context from collection '{docs_collection}'...")
+        chunks, error = search_docs_collection(
+            collection=docs_collection,
+            docs_root=docs_root,
+            query=base_prompt,
+            limit=MAX_DOC_RESULTS,
+        )
+        if error:
+            sys.stderr.write(f"Error: docs augmentation unavailable ({error}).\n")
+            return 4
+
+        context_text = format_docs_context(chunks, docs_collection)
+        final_prompt = build_grounded_prompt(base_prompt, context_text, "docs")
+        log_info(f"[ask] Docs grounding enabled ({len(chunks)} chunks).")
+
+    elif args.auto:
+        log_info("[ask] Auto mode found no available retrieval backend; running ungrounded.")
+
+    if args.command_only:
+        system_prompt = COMMAND_ONLY_SYSTEM
+        if args.system:
+            system_prompt = f"{system_prompt}\nAdditional constraints:\n{args.system.strip()}"
+    else:
+        system_prompt = args.system
+
+    use_stream_tts = args.tts and args.tts_configure == "stream"
+    output_was_stream_printed = False
+    return_code = 1
+    stdout_text = ""
+    stderr_text = ""
+    for attempt in range(2):
+        if use_stream_tts:
+            emit_stream_stdout = not args.command_only
+            return_code, stdout_text, stderr_text = run_llm_stream(
+                prompt=final_prompt,
+                model=model,
+                system_prompt=system_prompt,
+                show_spinner=not args.no_spinner,
+                spinner_style=spinner_style,
+                emit_stdout=emit_stream_stdout,
+                enable_stream_tts=True,
+            )
+            output_was_stream_printed = emit_stream_stdout
+        else:
+            return_code, stdout_text, stderr_text = run_llm(
+                prompt=final_prompt,
+                model=model,
+                system_prompt=system_prompt,
+                show_spinner=not args.no_spinner,
+                spinner_style=spinner_style,
+            )
+        if return_code == 0:
+            break
+        if attempt == 0 and maybe_setup_missing_api_key(stderr_text, model_hint=model):
+            log_info("[ask] Retrying model invocation after key setup...")
+            continue
+        break
+
+    if return_code != 0:
+        sys.stderr.write(stderr_text.strip() + "\n" if stderr_text.strip() else "Unknown llm error\n")
+        return return_code
+
+    output = stdout_text.strip()
+    if args.command_only:
+        output = clean_command_output(output)
+        if args.no_output:
+            if not output:
+                sys.stderr.write("Error: no command was generated to execute.\n")
+                return 1
+            if args.tts and args.tts_configure != "stream":
+                speak(output)
+            return execute_generated_command(output)
+
+    if output:
+        if not output_was_stream_printed:
+            sys.stdout.write(output)
+            if not output.endswith("\n"):
+                sys.stdout.write("\n")
+
+        if args.tts and args.tts_configure != "stream":
+            speak(output)
+
+    return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        sys.stderr.write("\n")
+        raise SystemExit(130)
+    except RuntimeError as exc:
+        sys.stderr.write(f"Error: {exc}\n")
+        raise SystemExit(1)

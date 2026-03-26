@@ -1,0 +1,29 @@
+site_name: local-terminal-llm Documentation
+site_description: Documentation for ask, a local-first terminal LLM workflow with retrieval, command mode, and TTS.
+edit_uri: ""
+docs_dir: docs
+theme:
+  name: mkdocs
+nav:
+  - Home: index.md
+  - Motivation: motivation.md
+  - Getting Started:
+    - Installation: getting-started/installation.md
+    - Quickstart: getting-started/quickstart.md
+  - Guides:
+    - Core Usage: guides/core-usage.md
+    - Command Mode: guides/command-mode.md
+    - Model Selection: guides/model-selection.md
+    - Retrieval Modes: guides/retrieval.md
+    - Text to Speech (TTS): guides/tts.md
+    - Shell Integration and Hotkeys: guides/hotkeys.md
+    - DevDocs Scraper: guides/devdocs-scraper.md
+  - Reference:
+    - Configuration: reference/configuration.md
+    - Troubleshooting: reference/troubleshooting.md
+  - Development: contributing.md
+markdown_extensions:
+  - toc:
+      permalink: true
+  - tables
+  - fenced_code
