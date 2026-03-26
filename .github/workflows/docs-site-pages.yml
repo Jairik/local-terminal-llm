@@ -34,7 +34,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install MkDocs
-        run: pip install mkdocs
+        run: pip install mkdocs mkdocs-material
 
       - name: Build documentation site
         run: mkdocs build --strict -f docs-site/mkdocs.yml --site-dir docs-site/site

@@ -28,7 +28,7 @@ Deployment is automated via `.github/workflows/docs-site-pages.yml`.
 
 On push to `main` (or manual dispatch), the workflow:
 
-1. installs MkDocs
+1. installs MkDocs and Material theme dependencies
 2. builds `docs-site`
 3. uploads artifact
 4. deploys to GitHub Pages
