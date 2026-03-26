@@ -37,12 +37,12 @@ jobs:
         run: pip install mkdocs
 
       - name: Build documentation site
-        run: mkdocs build --strict -f docs-site/mkdocs.yml --site-dir site
+        run: mkdocs build --strict -f docs-site/mkdocs.yml --site-dir docs-site/site
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: site
+          path: docs-site/site
 
   deploy:
     needs: build
