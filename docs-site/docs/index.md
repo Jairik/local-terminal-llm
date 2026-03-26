@@ -50,4 +50,5 @@ ask --tts --tts-configure stream "summarize this changelog"
 - [Quickstart](getting-started/quickstart.md)
 - [Guides](guides/core-usage.md)
 - [Configuration Reference](reference/configuration.md)
+- [Safety and Security](reference/safety-security.md)
 - [Troubleshooting](reference/troubleshooting.md)

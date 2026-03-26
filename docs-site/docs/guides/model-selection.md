@@ -38,3 +38,8 @@ ask -p "analyze this architecture and provide migration phases"
 ## Missing API Key Handling
 
 If a selected provider key is missing, the CLI can prompt you to paste a key and retry.
+You can also preconfigure all provider/env keys with:
+
+```sh
+ask --env-setup
+```

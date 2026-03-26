@@ -25,10 +25,16 @@ The setup script can:
 - install `askllm`
 - append shell extension sourcing to the right shell config file
 - configure alias and hotkeys
-- validate/install runtime dependencies
+- validate/install runtime dependencies (including `llm`)
 
 During interactive setup, you will be asked whether to use the default alias `ask`.
 Press Enter for default, or choose custom alias input.
+
+After setup, you can configure all environment keys with:
+
+```sh
+ask --env-setup
+```
 
 ## Dependency-only Mode
 

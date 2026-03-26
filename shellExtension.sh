@@ -11,7 +11,7 @@ if [ "$ASK_ALIAS_NAME" != "ask" ] && alias "$ASK_ALIAS_NAME" >/dev/null 2>&1; th
 fi
 
 # Hotkey defaults. Set these in your shell config before sourcing this file.
-ASK_HOTKEY_ASK="${ASK_HOTKEY_ASK:-^I}"
+ASK_HOTKEY_ASK="${ASK_HOTKEY_ASK-^I}"
 _askllm_hotkey_cmd_defaulted=0
 if [ -z "${ASK_HOTKEY_ASK_CMD+x}" ]; then
   ASK_HOTKEY_ASK_CMD="${ASK_ALIAS_NAME} "
@@ -147,9 +147,39 @@ _askllm_bash_bind_hotkey() {
   bind -x "\"$_askllm_bind_seq\":\"$_askllm_func\""
 }
 
+_askllm_bash_unbind_existing_hotkeys() {
+  _askllm_dump="$(bind -X 2>/dev/null || true)"
+  [ -n "$_askllm_dump" ] || return 0
+
+  while IFS= read -r _askllm_line; do
+    case "$_askllm_line" in
+      *'"_askllm_bash_insert_ask"'*|*'"_askllm_bash_insert_codex"'*|*'"_askllm_bash_insert_claude"'*|*'"_askllm_bash_insert_custom"'*)
+        _askllm_seq=$(printf '%s\n' "$_askllm_line" | sed -n 's/^"\([^"]*\)".*/\1/p')
+        [ -n "$_askllm_seq" ] && bind -r "$_askllm_seq" >/dev/null 2>&1 || true
+        ;;
+    esac
+  done <<EOF
+$_askllm_dump
+EOF
+}
+
+_askllm_bash_restore_tab_complete_if_needed() {
+  _askllm_ask_seq=""
+  if [ -n "${ASK_HOTKEY_ASK-}" ]; then
+    _askllm_ask_seq=$(_askllm_bash_normalize_hotkey "$ASK_HOTKEY_ASK")
+  fi
+
+  if [ "$_askllm_ask_seq" != '\C-i' ]; then
+    bind '"\C-i": complete' >/dev/null 2>&1 || true
+  fi
+}
+
 _askllm_bind_hotkeys_bash() {
   [ -n "${BASH_VERSION-}" ] || return 0
   _askllm_shell_is_interactive || return 0
+
+  _askllm_bash_unbind_existing_hotkeys
+  _askllm_bash_restore_tab_complete_if_needed
 
   _askllm_bash_bind_hotkey "${ASK_HOTKEY_ASK-}" "_askllm_bash_insert_ask"
   _askllm_bash_bind_hotkey "${ASK_HOTKEY_CODEX-}" "_askllm_bash_insert_codex"

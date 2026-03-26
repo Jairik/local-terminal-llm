@@ -37,6 +37,7 @@ nav:
     - DevDocs Scraper: guides/devdocs-scraper.md
   - Reference:
     - Configuration: reference/configuration.md
+    - Safety and Security: reference/safety-security.md
     - Troubleshooting: reference/troubleshooting.md
   - Development: contributing.md
 markdown_extensions:

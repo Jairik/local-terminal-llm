@@ -827,6 +827,34 @@
   
   
     <li class="md-nav__item">
+      <a href="../../reference/safety-security/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Safety and Security
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../../reference/troubleshooting/" class="md-nav__link">
         
   
@@ -1002,10 +1030,13 @@
 <li>install <code>askllm</code></li>
 <li>append shell extension sourcing to the right shell config file</li>
 <li>configure alias and hotkeys</li>
-<li>validate/install runtime dependencies</li>
+<li>validate/install runtime dependencies (including <code>llm</code>)</li>
 </ul>
 <p>During interactive setup, you will be asked whether to use the default alias <code>ask</code>.
 Press Enter for default, or choose custom alias input.</p>
+<p>After setup, you can configure all environment keys with:</p>
+<pre><code class="language-sh">ask --env-setup
+</code></pre>
 <h2 id="dependency-only-mode">Dependency-only Mode<a class="headerlink" href="#dependency-only-mode" title="Permanent link">&para;</a></h2>
 <p>Use this when you only want dependency validation/install checks:</p>
 <pre><code class="language-sh">./scripts/setup.sh --dep-only

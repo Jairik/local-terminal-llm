@@ -28,6 +28,12 @@ Remove all existing askllm keybindings:
 ./scripts/remove-keybindings.sh
 ```
 
+If your current Bash session still has TAB remapped, run:
+
+```sh
+bind '"\C-i": complete'
+```
+
 ## Environment Variable Controls
 
 - `ASK_HOTKEY_ASK`

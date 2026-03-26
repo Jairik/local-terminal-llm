@@ -816,6 +816,34 @@
   
   
     <li class="md-nav__item">
+      <a href="../../reference/safety-security/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Safety and Security
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../../reference/troubleshooting/" class="md-nav__link">
         
   
@@ -967,8 +995,15 @@
 <h2 id="default-alias">Default Alias<a class="headerlink" href="#default-alias" title="Permanent link">&para;</a></h2>
 <p>Default alias is <code>ask</code>, configurable during setup or via <code>--alias</code>.</p>
 <h2 id="hotkey-setup-via-script">Hotkey Setup via Script<a class="headerlink" href="#hotkey-setup-via-script" title="Permanent link">&para;</a></h2>
+<p>Hotkeys are disabled by default when using <code>setup.sh</code>.</p>
 <pre><code class="language-sh">./scripts/setup.sh --shell zsh --hotkey '^G'
 ./scripts/setup.sh --shell zsh --codex-hotkey '^O' --claude-hotkey '^Y'
+</code></pre>
+<p>Remove all existing askllm keybindings:</p>
+<pre><code class="language-sh">./scripts/remove-keybindings.sh
+</code></pre>
+<p>If your current Bash session still has TAB remapped, run:</p>
+<pre><code class="language-sh">bind '&quot;\C-i&quot;: complete'
 </code></pre>
 <h2 id="environment-variable-controls">Environment Variable Controls<a class="headerlink" href="#environment-variable-controls" title="Permanent link">&para;</a></h2>
 <ul>

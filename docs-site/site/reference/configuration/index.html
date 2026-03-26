@@ -14,7 +14,7 @@
         <link rel="prev" href="../../guides/devdocs-scraper/">
       
       
-        <link rel="next" href="../troubleshooting/">
+        <link rel="next" href="../safety-security/">
       
       
         
@@ -768,6 +768,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#interactive-env-setup" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Interactive Env Setup
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#config-file" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -793,6 +804,34 @@
   
 </nav>
       
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../safety-security/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Safety and Security
+  
+
+    
+  </span>
+  
+  
+
+      </a>
     </li>
   
 
@@ -898,6 +937,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#interactive-env-setup" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Interactive Env Setup
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#config-file" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -952,7 +1002,16 @@
 <li><code>-p</code>, <code>--power</code></li>
 <li><code>--web</code>, <code>--docs</code>, <code>--auto</code></li>
 <li><code>--tts</code>, <code>--tts-configure</code></li>
+<li><code>--env-setup</code>, <code>--env-shell</code>, <code>--env-config-file</code></li>
 </ul>
+<h2 id="interactive-env-setup">Interactive Env Setup<a class="headerlink" href="#interactive-env-setup" title="Permanent link">&para;</a></h2>
+<p>Configure all supported environment keys in one guided flow:</p>
+<pre><code class="language-sh">ask --env-setup
+</code></pre>
+<p>Optional shell/config targeting:</p>
+<pre><code class="language-sh">ask --env-setup --env-shell zsh --env-config-file ~/.zshrc
+</code></pre>
+<p>By default, API keys entered in this setup are stored in your local <code>llm</code> key store and are not written to shell config unless you explicitly opt in.</p>
 <h2 id="config-file">Config File<a class="headerlink" href="#config-file" title="Permanent link">&para;</a></h2>
 <p>Default:</p>
 <ul>
@@ -968,15 +1027,21 @@
 <p>Core:</p>
 <ul>
 <li><code>ASK_MODEL</code></li>
+<li><code>ASK_POWER_MODEL</code></li>
 <li><code>ASK_SYSTEM</code></li>
 <li><code>ASK_CONFIG_FILE</code></li>
 <li><code>ASK_ALIAS_NAME</code></li>
+<li><code>ASKLLM_BIN</code></li>
 </ul>
 <p>Retrieval:</p>
 <ul>
 <li><code>ASK_DOCS_DB</code></li>
 <li><code>ASK_DOCS_COLLECTION</code></li>
 <li><code>ASK_WEB_PROVIDER</code></li>
+</ul>
+<p>UI:</p>
+<ul>
+<li><code>ASK_SPINNER_STYLE</code></li>
 </ul>
 <p>TTS:</p>
 <ul>
@@ -995,6 +1060,18 @@
 <li><code>ASK_HOTKEY_CLAUDE_CMD</code></li>
 <li><code>ASK_HOTKEY_CUSTOM</code></li>
 <li><code>ASK_HOTKEY_CUSTOM_CMD</code></li>
+</ul>
+<p>Provider API key env names:</p>
+<ul>
+<li><code>OPENAI_API_KEY</code></li>
+<li><code>ANTHROPIC_API_KEY</code></li>
+<li><code>GOOGLE_API_KEY</code></li>
+<li><code>MISTRAL_API_KEY</code></li>
+<li><code>GROQ_API_KEY</code></li>
+<li><code>OPENROUTER_API_KEY</code></li>
+<li><code>COHERE_API_KEY</code></li>
+<li><code>HUGGINGFACE_API_KEY</code></li>
+<li><code>EXA_API_KEY</code></li>
 </ul>
 
 

@@ -104,6 +104,63 @@ MAX_WEB_RESULTS = 5
 MAX_DOC_RESULTS = 5
 CHUNK_SIZE = 1400
 CHUNK_OVERLAP = 200
+ENV_CONFIG_MARKER_START = "# >>> askllm environment configuration >>>"
+ENV_CONFIG_MARKER_END = "# <<< askllm environment configuration <<<"
+ENV_SETUP_SECTIONS: list[tuple[str, list[tuple[str, str]]]] = [
+    (
+        "Core",
+        [
+            ("ASK_MODEL", "Default model for normal invocations."),
+            ("ASK_POWER_MODEL", "OpenAI power model used by `ask -p`."),
+            ("ASK_SYSTEM", "Default system prompt."),
+            ("ASK_CONFIG_FILE", "Config file used for persisted model/spinner settings."),
+            ("ASK_ALIAS_NAME", "Shell alias name created by shell integration."),
+            ("ASKLLM_BIN", "Path to the askllm executable used by shell integration."),
+        ],
+    ),
+    (
+        "Retrieval",
+        [
+            ("ASK_DOCS_DB", "Root directory for docs collections and local indexes."),
+            ("ASK_DOCS_COLLECTION", "Default docs collection for `--auto` mode."),
+            ("ASK_WEB_PROVIDER", "Web retrieval provider: auto, exa, or ddgr."),
+        ],
+    ),
+    (
+        "UX / Output",
+        [
+            ("ASK_SPINNER_STYLE", "Spinner style: line, dots, or bounce."),
+            ("ASK_TTS_MODEL", "Path to the Piper TTS model file."),
+            ("ASK_TTS_SAMPLE_RATE", "Sample rate passed to aplay for TTS output."),
+            ("ASK_TTS_MODE", "Default TTS mode: full or stream."),
+            ("ASK_TTS_DELAY_SECONDS", "Streaming TTS queue delay (0.1 to 0.3 seconds)."),
+        ],
+    ),
+    (
+        "Hotkeys",
+        [
+            ("ASK_HOTKEY_ASK", "Hotkey for inserting ask command."),
+            ("ASK_HOTKEY_ASK_CMD", "Command inserted by ASK hotkey."),
+            ("ASK_HOTKEY_CODEX", "Hotkey for inserting codex command."),
+            ("ASK_HOTKEY_CODEX_CMD", "Command inserted by CODEX hotkey."),
+            ("ASK_HOTKEY_CLAUDE", "Hotkey for inserting claude command."),
+            ("ASK_HOTKEY_CLAUDE_CMD", "Command inserted by CLAUDE hotkey."),
+            ("ASK_HOTKEY_CUSTOM", "Hotkey for inserting custom command."),
+            ("ASK_HOTKEY_CUSTOM_CMD", "Command inserted by CUSTOM hotkey."),
+        ],
+    ),
+]
+API_KEY_SETUP_FIELDS: list[tuple[str, str]] = [
+    ("openai", "OPENAI_API_KEY"),
+    ("anthropic", "ANTHROPIC_API_KEY"),
+    ("google", "GOOGLE_API_KEY"),
+    ("mistral", "MISTRAL_API_KEY"),
+    ("groq", "GROQ_API_KEY"),
+    ("openrouter", "OPENROUTER_API_KEY"),
+    ("cohere", "COHERE_API_KEY"),
+    ("huggingface", "HUGGINGFACE_API_KEY"),
+    ("exa", "EXA_API_KEY"),
+]
 
 
 @dataclass
@@ -621,6 +678,32 @@ def provider_to_env_var(provider: str) -> str:
     return f"{sanitized}_API_KEY" if sanitized else "API_KEY"
 
 
+def read_llm_api_key(provider: str) -> str:
+    normalized = provider.strip().lower()
+    if not normalized:
+        return ""
+    if not shutil.which("llm"):
+        return ""
+
+    return_code, stdout, _ = run_subprocess(["llm", "keys", "get", normalized])
+    if return_code != 0:
+        return ""
+    return stdout.strip()
+
+
+def resolve_provider_api_key(provider: str, env_var: str) -> tuple[str, str | None]:
+    value = os.environ.get(env_var, "").strip()
+    if value:
+        return value, None
+
+    llm_value = read_llm_api_key(provider)
+    if llm_value:
+        os.environ[env_var] = llm_value
+        return llm_value, None
+
+    return "", f"{env_var} is not set and llm key '{provider}' was not found"
+
+
 def parse_missing_api_key_error(error_text: str) -> tuple[str | None, str | None]:
     text = (error_text or "").strip()
     if not text:
@@ -695,6 +778,105 @@ def maybe_setup_missing_api_key(error_text: str, model_hint: str = "") -> bool:
     return True
 
 
+def parse_unknown_model_error(error_text: str) -> str | None:
+    text = (error_text or "").strip()
+    if not text:
+        return None
+
+    match = re.search(r"Unknown model:\s*['\"]?([A-Za-z0-9_.:/-]+)['\"]?", text, flags=re.IGNORECASE)
+    if not match:
+        return None
+
+    model_name = match.group(1).strip().strip("'\"")
+    if not model_name:
+        return None
+    return model_name
+
+
+def llm_plugin_is_installed(plugin_name: str) -> bool:
+    if not shutil.which("llm"):
+        return False
+
+    return_code, stdout, _ = run_subprocess(["llm", "plugins"])
+    if return_code != 0:
+        return False
+
+    normalized_target = plugin_name.strip().lower()
+    for line in stdout.splitlines():
+        if normalized_target in line.strip().lower():
+            return True
+    return False
+
+
+def ensure_llm_ollama_provider() -> tuple[bool, str | None]:
+    if not shutil.which("llm"):
+        return False, "`llm` is not installed or not on PATH"
+
+    if llm_plugin_is_installed("llm-ollama"):
+        return True, None
+
+    log_info("[ask] Configuring local model provider plugin (`llm-ollama`)...")
+    return_code, stdout, stderr = run_subprocess(["llm", "install", "llm-ollama"])
+    if return_code != 0:
+        detail = stderr.strip() or stdout.strip() or "llm install llm-ollama returned a non-zero exit code"
+        if "already installed" not in detail.lower():
+            return False, detail
+    return True, None
+
+
+def install_ollama_model(model_name: str) -> tuple[bool, str | None]:
+    if not shutil.which("ollama"):
+        return False, "`ollama` is not installed or not on PATH"
+
+    return_code, stdout, stderr = run_subprocess(["ollama", "pull", model_name])
+    if return_code != 0:
+        detail = stderr.strip() or stdout.strip() or f"ollama pull exited with code {return_code}"
+        return False, detail
+    return True, None
+
+
+def maybe_setup_missing_model(error_text: str, model_hint: str = "") -> bool:
+    parsed_model = parse_unknown_model_error(error_text)
+    if parsed_model is None:
+        return False
+
+    model_name = parsed_model
+
+    if ":" not in model_name:
+        return False
+
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        return False
+
+    if not prompt_yes_no(f"Model '{model_name}' is not installed. Install it now?", default_yes=True):
+        return False
+
+    ok, detail = ensure_llm_ollama_provider()
+    if not ok:
+        log_info(f"[ask] Could not configure `llm-ollama`: {detail}")
+        return False
+
+    log_info(f"[ask] Pulling local model '{model_name}' via Ollama...")
+    ok, detail = install_ollama_model(model_name)
+    if not ok:
+        log_info(f"[ask] Could not install model '{model_name}': {detail}")
+        if "ollama" in (detail or "").lower():
+            log_info("[ask] Install Ollama first: https://ollama.com/download")
+        return False
+
+    models, models_error = available_models()
+    if models_error:
+        log_info(f"[ask] Installed model '{model_name}'. Could not verify via `llm models`: {models_error}")
+    elif model_name not in models:
+        log_info(
+            f"[ask] Installed model '{model_name}', but `llm models` does not list it yet. "
+            "You may need to restart your shell session."
+        )
+    else:
+        log_info(f"[ask] Model '{model_name}' is ready.")
+    return True
+
+
 def parse_model_id_from_line(line: str) -> str:
     match = re.match(r"^[^:]+:\s+([^\s(]+)", line.strip())
     if not match:
@@ -728,6 +910,229 @@ def prompt_yes_no(question: str, default_yes: bool = False) -> bool:
     if not answer:
         return default_yes
     return answer in {"y", "yes"}
+
+
+def normalize_shell_name(shell_name: str) -> str:
+    lowered = shell_name.strip().lower()
+    if "zsh" in lowered:
+        return "zsh"
+    if "bash" in lowered:
+        return "bash"
+    if "fish" in lowered:
+        return "fish"
+    if "ksh" in lowered or "mksh" in lowered or "pdksh" in lowered:
+        return "ksh"
+    if "sh" in lowered or "dash" in lowered:
+        return "sh"
+    return "sh"
+
+
+def default_shell_config_for(shell_name: str) -> str:
+    mapping = {
+        "zsh": "~/.zshrc",
+        "bash": "~/.bashrc",
+        "fish": "~/.config/fish/config.fish",
+        "ksh": "~/.kshrc",
+        "sh": "~/.profile",
+    }
+    return mapping.get(shell_name, "~/.profile")
+
+
+def escape_single_quoted_value(value: str) -> str:
+    return value.replace("'", "'\\''")
+
+
+def render_shell_env_line(shell_name: str, key: str, value: str) -> str:
+    clean_value = value.replace("\n", " ").replace("\r", " ")
+    escaped = escape_single_quoted_value(clean_value)
+    if shell_name == "fish":
+        return f"set -gx {key} '{escaped}'"
+    return f"export {key}='{escaped}'"
+
+
+def remove_marked_block(content: str, start_marker: str, end_marker: str) -> str:
+    cleaned_lines: list[str] = []
+    skipping = False
+    for line in content.splitlines():
+        if line == start_marker:
+            skipping = True
+            continue
+        if line == end_marker:
+            skipping = False
+            continue
+        if not skipping:
+            cleaned_lines.append(line)
+    return "\n".join(cleaned_lines)
+
+
+def persist_env_block(
+    config_path: Path,
+    shell_name: str,
+    env_values: dict[str, str],
+    ordered_keys: list[str],
+) -> tuple[bool, str | None]:
+    lines = [
+        ENV_CONFIG_MARKER_START,
+        "# Generated by `ask --env-setup`.",
+    ]
+    for key in ordered_keys:
+        if key in env_values:
+            lines.append(render_shell_env_line(shell_name, key, env_values[key]))
+    lines.append(ENV_CONFIG_MARKER_END)
+    block = "\n".join(lines) + "\n"
+
+    existing = ""
+    if config_path.exists():
+        try:
+            existing = config_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            return False, str(exc)
+
+    cleaned = remove_marked_block(existing, ENV_CONFIG_MARKER_START, ENV_CONFIG_MARKER_END).rstrip("\n")
+    if cleaned:
+        payload = f"{cleaned}\n\n{block}"
+    else:
+        payload = block
+
+    try:
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(payload, encoding="utf-8")
+    except OSError as exc:
+        return False, str(exc)
+    return True, None
+
+
+def default_env_setup_values() -> dict[str, str]:
+    alias_name = os.environ.get("ASK_ALIAS_NAME", "").strip() or "ask"
+    ask_hotkey_cmd = os.environ.get("ASK_HOTKEY_ASK_CMD", "")
+    if not ask_hotkey_cmd:
+        ask_hotkey_cmd = f"{alias_name} "
+
+    return {
+        "ASK_MODEL": resolve_default_model(),
+        "ASK_POWER_MODEL": resolve_power_model(),
+        "ASK_SYSTEM": DEFAULT_SYSTEM,
+        "ASK_CONFIG_FILE": DEFAULT_CONFIG_FILE,
+        "ASK_ALIAS_NAME": alias_name,
+        "ASKLLM_BIN": os.environ.get("ASKLLM_BIN", "~/.local/bin/askllm").strip() or "~/.local/bin/askllm",
+        "ASK_DOCS_DB": DEFAULT_DOCS_DB,
+        "ASK_DOCS_COLLECTION": DEFAULT_DOCS_COLLECTION,
+        "ASK_WEB_PROVIDER": DEFAULT_WEB_PROVIDER,
+        "ASK_SPINNER_STYLE": resolve_spinner_style(),
+        "ASK_TTS_MODEL": DEFAULT_TTS_MODEL,
+        "ASK_TTS_SAMPLE_RATE": DEFAULT_TTS_SAMPLE_RATE,
+        "ASK_TTS_MODE": DEFAULT_TTS_MODE,
+        "ASK_TTS_DELAY_SECONDS": os.environ.get("ASK_TTS_DELAY_SECONDS", f"{DEFAULT_TTS_DELAY_SECONDS:g}").strip()
+        or f"{DEFAULT_TTS_DELAY_SECONDS:g}",
+        "ASK_HOTKEY_ASK": os.environ.get("ASK_HOTKEY_ASK", "^I"),
+        "ASK_HOTKEY_ASK_CMD": ask_hotkey_cmd,
+        "ASK_HOTKEY_CODEX": os.environ.get("ASK_HOTKEY_CODEX", ""),
+        "ASK_HOTKEY_CODEX_CMD": os.environ.get("ASK_HOTKEY_CODEX_CMD", "codex "),
+        "ASK_HOTKEY_CLAUDE": os.environ.get("ASK_HOTKEY_CLAUDE", ""),
+        "ASK_HOTKEY_CLAUDE_CMD": os.environ.get("ASK_HOTKEY_CLAUDE_CMD", "claude "),
+        "ASK_HOTKEY_CUSTOM": os.environ.get("ASK_HOTKEY_CUSTOM", ""),
+        "ASK_HOTKEY_CUSTOM_CMD": os.environ.get("ASK_HOTKEY_CUSTOM_CMD", ""),
+    }
+
+
+def prompt_env_setup_value(env_var: str, description: str, default_value: str) -> str | None:
+    print(f"- {env_var}: {description}")
+    shown_default = default_value if default_value != "" else "<empty>"
+    value = input(f"  value [{shown_default}] (! to skip): ")
+    if value.strip() == "!":
+        return None
+    if value == "":
+        return default_value
+    return value
+
+
+def run_env_setup(shell_hint: str, config_override: str) -> None:
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        raise RuntimeError("--env-setup requires an interactive terminal")
+
+    detected_shell = shell_hint if shell_hint != "auto" else os.path.basename(os.environ.get("SHELL", "sh"))
+    shell_name = normalize_shell_name(detected_shell)
+
+    if config_override.strip():
+        config_path = Path(config_override).expanduser()
+    else:
+        config_path = Path(default_shell_config_for(shell_name)).expanduser()
+
+    log_info("[ask] Environment setup wizard.")
+    log_info("[ask] Press Enter to keep defaults. Type ! to skip a key.")
+    log_info(f"[ask] Shell export syntax: {shell_name}")
+    log_info(f"[ask] Target config file: {config_path}")
+
+    if not prompt_yes_no("Use this config file path?", default_yes=True):
+        custom_path = input("Config file path (blank to keep current): ").strip()
+        if custom_path:
+            config_path = Path(custom_path).expanduser()
+            log_info(f"[ask] Updated config target: {config_path}")
+
+    defaults = default_env_setup_values()
+    env_values: dict[str, str] = {}
+    ordered_keys: list[str] = []
+
+    for section_name, fields in ENV_SETUP_SECTIONS:
+        print(f"\n[{section_name}]")
+        for env_var, description in fields:
+            ordered_keys.append(env_var)
+            default_value = defaults.get(env_var, "")
+            selected = prompt_env_setup_value(env_var, description, default_value)
+            if selected is None:
+                continue
+            env_values[env_var] = selected
+
+    print("\n[API Keys]")
+    print("Values are hidden while typing. Blank input skips that provider.")
+    provider_values: list[tuple[str, str, str]] = []
+    for provider, env_var in API_KEY_SETUP_FIELDS:
+        key_value = getpass.getpass(f"  {env_var} ({provider}): ").strip()
+        if key_value:
+            provider_values.append((provider, env_var, key_value))
+
+    if provider_values:
+        saved_count = 0
+        if not shutil.which("llm"):
+            log_info("[ask] `llm` not found; API keys were loaded only for this process.")
+            for _, env_var, key_value in provider_values:
+                os.environ[env_var] = key_value
+        else:
+            for provider, env_var, key_value in provider_values:
+                return_code, _, stderr = run_subprocess(["llm", "keys", "set", provider, "--value", key_value])
+                if return_code == 0:
+                    saved_count += 1
+                    os.environ[env_var] = key_value
+                else:
+                    detail = stderr.strip() or "llm keys set returned a non-zero exit code"
+                    log_info(f"[ask] Could not store llm key '{provider}': {detail}")
+            if saved_count:
+                log_info(f"[ask] Stored {saved_count} API key(s) in local llm key store.")
+
+        if prompt_yes_no(
+            "Also write API keys into your shell config as env vars? (less secure)",
+            default_yes=False,
+        ):
+            for _, env_var, key_value in provider_values:
+                env_values[env_var] = key_value
+                if env_var not in ordered_keys:
+                    ordered_keys.append(env_var)
+            log_info("[ask] API keys will also be written into the env config block.")
+
+    if not env_values:
+        log_info("[ask] No non-secret environment values selected for shell config update.")
+        return
+
+    if not prompt_yes_no(f"Write environment block to {config_path}?", default_yes=True):
+        log_info("[ask] Skipped writing shell config block.")
+        return
+
+    ok, error = persist_env_block(config_path, shell_name, env_values, ordered_keys)
+    if not ok:
+        raise RuntimeError(f"Could not persist env configuration: {error}")
+
+    log_info(f"[ask] Saved environment configuration block to {config_path}.")
+    log_info("[ask] Reload your shell or source the config file to apply changes.")
 
 
 def clip_text(text: str, max_length: int) -> str:
@@ -865,9 +1270,9 @@ def execute_generated_command(command: str) -> int:
 
 
 def search_web_exa(query: str, max_results: int = MAX_WEB_RESULTS) -> tuple[list[SearchResult], str | None]:
-    api_key = os.environ.get("EXA_API_KEY", "").strip()
-    if not api_key:
-        return [], "EXA_API_KEY is not set"
+    api_key, key_error = resolve_provider_api_key("exa", "EXA_API_KEY")
+    if key_error:
+        return [], key_error
 
     payload = {
         "query": query,
@@ -1312,6 +1717,10 @@ def parse_args() -> argparse.Namespace:
             "API key handling:\n"
             "  on missing-key errors, ask can prompt you to paste/set a key and retry\n"
             "  ask can print an export command for quick copy/paste\n\n"
+            "Environment setup:\n"
+            "  --env-setup prompts for all supported env keys across ask + shell integration\n"
+            "  API keys are saved in local llm key storage by default\n"
+            "  --env-shell/--env-config-file can override export syntax and target config path\n\n"
             "Spinner styles:\n"
             "  --spinner-style selects animation for this run\n"
             "  --spinner-style-select saves default spinner style\n\n"
@@ -1331,6 +1740,8 @@ def parse_args() -> argparse.Namespace:
             "  ask --spinner-style dots \"explain rsync\"\n"
             "  ask --tts \"summarize this\"\n"
             "  ask --tts --tts-configure stream \"summarize this\"\n"
+            "  ask --env-setup\n"
+            "  ask --env-setup --env-shell zsh --env-config-file ~/.zshrc\n"
             "  ask --web \"latest bun install instructions\"\n"
             "  ask --docs mydocs \"how do vite path aliases work\"\n"
             "  cat package.json | ask -co \"write a jq command for dependencies\""
@@ -1409,6 +1820,22 @@ def parse_args() -> argparse.Namespace:
         help=f"TTS mode when --tts is enabled (default: {DEFAULT_TTS_MODE}).",
     )
     parser.add_argument(
+        "--env-setup",
+        action="store_true",
+        help="Interactive setup for all supported env keys and API-key providers.",
+    )
+    parser.add_argument(
+        "--env-shell",
+        default="auto",
+        choices=["auto", "zsh", "bash", "fish", "ksh", "sh"],
+        help="Shell syntax target for --env-setup (default: auto-detect from $SHELL).",
+    )
+    parser.add_argument(
+        "--env-config-file",
+        default="",
+        help="Override shell config file path used by --env-setup.",
+    )
+    parser.add_argument(
         "-no",
         "--no-output",
         action="store_true",
@@ -1452,6 +1879,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--power cannot be combined with --model; choose one")
     if args.power_config and not is_openai_model_name(args.power_config):
         parser.error("--power-config must be an OpenAI model (for example: gpt-5.4)")
+    if args.env_shell != "auto" and not args.env_setup:
+        parser.error("--env-shell requires --env-setup")
+    if args.env_config_file and not args.env_setup:
+        parser.error("--env-config-file requires --env-setup")
 
     return args
 
@@ -1729,6 +2160,10 @@ def main() -> int:
         log_info(f"[ask] Spinner style set to '{selected_spinner_style}'.")
         did_configuration = True
 
+    if args.env_setup:
+        run_env_setup(shell_hint=args.env_shell, config_override=args.env_config_file)
+        did_configuration = True
+
     if args.power:
         model = resolve_power_model()
         if not is_openai_model_name(model):
@@ -1827,6 +2262,9 @@ def main() -> int:
             )
         if return_code == 0:
             break
+        if attempt == 0 and maybe_setup_missing_model(stderr_text, model_hint=model):
+            log_info("[ask] Retrying model invocation after model setup...")
+            continue
         if attempt == 0 and maybe_setup_missing_api_key(stderr_text, model_hint=model):
             log_info("[ask] Retrying model invocation after key setup...")
             continue

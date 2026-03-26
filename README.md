@@ -29,8 +29,15 @@ A local-first shell copilot wrapper around the `llm` CLI.
 
 When run interactively, `setup.sh` asks whether to keep the default command alias `ask` or configure a custom alias.
 Hotkeys are disabled by default when using `setup.sh`.
+Normal setup also validates/installs runtime dependencies (including `llm`) to avoid missing PATH/runtime errors.
 
 Then reload your shell config (or open a new shell).
+
+Configure all supported environment keys interactively:
+
+```sh
+ask --env-setup
+```
 
 ### Shell-specific setup (optional)
 
@@ -63,6 +70,12 @@ To remove all existing keybindings from your shell config:
 
 ```sh
 ./scripts/remove-keybindings.sh
+```
+
+If your current Bash session still has TAB remapped, run:
+
+```sh
+bind '"\C-i": complete'
 ```
 
 You can also configure shortcuts for other CLI tools like codex or claude:
@@ -127,6 +140,8 @@ ask -sm llama3.2:3b
 
 The picker now prints ASCII model cards for the current default model and your newly selected model.
 If a provider/API key is missing at runtime, `ask` will prompt to set one and can print an `export ...` command for copy/paste.
+If a local Ollama-style model is missing (for example `phi3:mini`), `ask` can prompt to install/configure it and then retry.
+Provider keys can also be entered in one pass with `ask --env-setup`.
 
 Power model (OpenAI) configuration and usage:
 
@@ -155,14 +170,34 @@ This stores the default in:
 
 Environment variables still work:
 
-- `ASK_MODEL` (highest priority default)
-- `ASK_ALIAS_NAME`
+Core:
+
+- `ASK_MODEL` (highest-priority default model)
+- `ASK_POWER_MODEL`
 - `ASK_SYSTEM`
+- `ASK_CONFIG_FILE`
+- `ASK_ALIAS_NAME`
+- `ASKLLM_BIN`
+
+Retrieval:
+
 - `ASK_DOCS_DB`
 - `ASK_DOCS_COLLECTION`
 - `ASK_WEB_PROVIDER`
-- `ASK_CONFIG_FILE`
+
+TTS:
+
+- `ASK_TTS_MODEL`
+- `ASK_TTS_SAMPLE_RATE`
+- `ASK_TTS_MODE`
+- `ASK_TTS_DELAY_SECONDS`
+
+UI:
+
 - `ASK_SPINNER_STYLE`
+
+Hotkeys:
+
 - `ASK_HOTKEY_ASK`
 - `ASK_HOTKEY_ASK_CMD`
 - `ASK_HOTKEY_CODEX`
@@ -171,6 +206,24 @@ Environment variables still work:
 - `ASK_HOTKEY_CLAUDE_CMD`
 - `ASK_HOTKEY_CUSTOM`
 - `ASK_HOTKEY_CUSTOM_CMD`
+
+API key env names:
+
+- `OPENAI_API_KEY`
+- `ANTHROPIC_API_KEY`
+- `GOOGLE_API_KEY`
+- `MISTRAL_API_KEY`
+- `GROQ_API_KEY`
+- `OPENROUTER_API_KEY`
+- `COHERE_API_KEY`
+- `HUGGINGFACE_API_KEY`
+- `EXA_API_KEY`
+
+## Safety / Security
+
+- API keys entered through `ask` are saved locally using `llm keys set` (offline key store on your machine).
+- `ask --env-setup` does not write API keys to your shell config unless you explicitly opt in.
+- Provider key handling is local-first and integrated with the `llm` key workflow (`llm keys set/get`).
 
 ## Docs mode layout
 

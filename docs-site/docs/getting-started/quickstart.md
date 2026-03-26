@@ -37,6 +37,13 @@ ask -ms
 ask -ms llama3.2:3b
 ```
 
+## Environment Setup
+
+```sh
+# prompt for all supported env keys and provider keys
+ask --env-setup
+```
+
 ## TTS
 
 ```sh

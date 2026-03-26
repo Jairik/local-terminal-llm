@@ -11,7 +11,7 @@
       
       
       
-        <link rel="prev" href="../configuration/">
+        <link rel="prev" href="../safety-security/">
       
       
         <link rel="next" href="../../contributing/">
@@ -722,6 +722,34 @@
                 
   
   
+  
+  
+    <li class="md-nav__item">
+      <a href="../safety-security/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Safety and Security
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
     
   
   
@@ -807,6 +835,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#unknown-chat-model-in-ask" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Unknown chat model in ask
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#tts-not-speaking" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -822,6 +861,17 @@
     <span class="md-ellipsis">
       
         ask command not found
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#llm-is-not-installed-or-not-on-path" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        llm is not installed or not on PATH
       
     </span>
   </a>
@@ -931,6 +981,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#unknown-chat-model-in-ask" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Unknown chat model in ask
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#tts-not-speaking" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -946,6 +1007,17 @@
     <span class="md-ellipsis">
       
         ask command not found
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#llm-is-not-installed-or-not-on-path" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        llm is not installed or not on PATH
       
     </span>
   </a>
@@ -996,6 +1068,16 @@
 llm plugins
 </code></pre>
 <p>Use a model identifier available in your local <code>llm</code> installation or install the required embedding plugin/provider.</p>
+<h2 id="unknown-chat-model-in-ask">Unknown chat model in <code>ask</code><a class="headerlink" href="#unknown-chat-model-in-ask" title="Permanent link">&para;</a></h2>
+<p>Example:</p>
+<p><code>Error: 'Unknown model: phi3:mini'</code></p>
+<p>If run in an interactive terminal, <code>ask</code> now prompts:</p>
+<p><code>Model 'phi3:mini' is not installed. Install it now? [Y/n]</code></p>
+<p>On <code>Y</code>, it attempts local model setup (<code>llm-ollama</code> provider + <code>ollama pull &lt;model&gt;</code>), then retries.
+If setup still fails, verify:</p>
+<pre><code class="language-sh">llm plugins
+ollama list
+</code></pre>
 <h2 id="tts-not-speaking">TTS not speaking<a class="headerlink" href="#tts-not-speaking" title="Permanent link">&para;</a></h2>
 <p>Check:</p>
 <pre><code class="language-sh">which piper
@@ -1012,7 +1094,14 @@ which aplay
 <li>Open a new terminal session</li>
 <li>Ensure shell config has extension/source block</li>
 <li>Confirm install path is in <code>PATH</code></li>
+<li>Re-run <code>./scripts/setup.sh</code> to reinstall dependencies and shell wiring</li>
 </ul>
+<h2 id="llm-is-not-installed-or-not-on-path"><code>llm</code> is not installed or not on <code>PATH</code><a class="headerlink" href="#llm-is-not-installed-or-not-on-path" title="Permanent link">&para;</a></h2>
+<pre><code class="language-sh">./scripts/setup.sh
+</code></pre>
+<p>Or dependency-only mode:</p>
+<pre><code class="language-sh">./scripts/setup.sh --dep-only
+</code></pre>
 <h2 id="web-retrieval-unavailable">Web retrieval unavailable<a class="headerlink" href="#web-retrieval-unavailable" title="Permanent link">&para;</a></h2>
 <ul>
 <li>Verify selected provider dependencies</li>

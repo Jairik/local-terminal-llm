@@ -35,6 +35,7 @@ show_help() {
 Usage: setup.sh [options]
 
 Install askllm and append shell integration in one command.
+Runtime dependencies are validated/installed during normal setup.
 
 Options:
   -s, --shell NAME      Shell type (zsh, bash, fish, ...)
@@ -62,6 +63,7 @@ Notes:
   If --alias is not provided and setup is interactive, you will be prompted:
   - Enter/Y -> use default alias `ask`
   - n       -> enter a custom alias name
+  Dependency installation runs in normal setup as well as --dep-only mode.
   Hotkeys are disabled by default during setup.
   Pass --ask-hotkey / --codex-hotkey / --claude-hotkey / --custom-hotkey to enable them.
 
@@ -432,6 +434,8 @@ if [ "$dep_only" -eq 1 ]; then
   install_dependencies
   exit 0
 fi
+
+install_dependencies
 
 prompt_alias_choice
 

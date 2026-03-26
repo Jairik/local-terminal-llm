@@ -7,6 +7,7 @@ dry_run=0
 
 disable_marker_start="# >>> askllm keybindings disabled >>>"
 disable_marker_end="# <<< askllm keybindings disabled <<<"
+extension_marker_start="# >>> askllm shell extension >>>"
 
 show_help() {
   cat <<'EOF'
@@ -138,6 +139,11 @@ if [ "$dry_run" -eq 1 ]; then
   echo "[dry-run] shell: $shell_name"
   echo "[dry-run] config file: $config_file"
   echo "[dry-run] askllm hotkey assignments would be removed"
+  if grep -F "$extension_marker_start" "$tmp_cleaned" >/dev/null 2>&1; then
+    echo "[dry-run] disable block would be inserted before askllm shell extension block"
+  else
+    echo "[dry-run] no askllm extension block found; disable block would be appended"
+  fi
   if [ "$shell_name" = "fish" ]; then
     echo "[dry-run] disable block:"
     printf '%s\n' "$disable_marker_start"
@@ -158,23 +164,48 @@ if [ "$dry_run" -eq 1 ]; then
   exit 0
 fi
 
-cat "$tmp_cleaned" > "$config_file"
-
-{
-  printf '\n%s\n' "$disable_marker_start"
-  if [ "$shell_name" = "fish" ]; then
-    printf "set -gx ASK_HOTKEY_ASK ''\n"
-    printf "set -gx ASK_HOTKEY_CODEX ''\n"
-    printf "set -gx ASK_HOTKEY_CLAUDE ''\n"
-    printf "set -gx ASK_HOTKEY_CUSTOM ''\n"
-  else
-    printf "export ASK_HOTKEY_ASK=''\n"
-    printf "export ASK_HOTKEY_CODEX=''\n"
-    printf "export ASK_HOTKEY_CLAUDE=''\n"
-    printf "export ASK_HOTKEY_CUSTOM=''\n"
-  fi
-  printf '%s\n' "$disable_marker_end"
-} >> "$config_file"
+awk \
+  -v ext_marker="$extension_marker_start" \
+  -v disable_start="$disable_marker_start" \
+  -v disable_end="$disable_marker_end" \
+  -v shell_name="$shell_name" \
+  '
+  function emit_disable_block() {
+    print disable_start
+    if (shell_name == "fish") {
+      print "set -gx ASK_HOTKEY_ASK '\'''\''"
+      print "set -gx ASK_HOTKEY_CODEX '\'''\''"
+      print "set -gx ASK_HOTKEY_CLAUDE '\'''\''"
+      print "set -gx ASK_HOTKEY_CUSTOM '\'''\''"
+    } else {
+      print "export ASK_HOTKEY_ASK='\'''\''"
+      print "export ASK_HOTKEY_CODEX='\'''\''"
+      print "export ASK_HOTKEY_CLAUDE='\'''\''"
+      print "export ASK_HOTKEY_CUSTOM='\'''\''"
+    }
+    print disable_end
+  }
+  {
+    if (!inserted && $0 == ext_marker) {
+      emit_disable_block()
+      print ""
+      inserted = 1
+    }
+    print
+  }
+  END {
+    if (!inserted) {
+      if (NR > 0) {
+        print ""
+      }
+      emit_disable_block()
+    }
+  }
+  ' "$tmp_cleaned" > "$config_file"
 
 echo "Removed askllm keybindings from $config_file"
 echo "Reload your shell config (or open a new shell)."
+if [ "$shell_name" = "bash" ]; then
+  echo "If TAB is still remapped in the current shell session, run:"
+  echo "  bind '\"\\C-i\": complete'"
+fi
